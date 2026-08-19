@@ -16,7 +16,13 @@ def watts_to_lsb(value_watts, lsb_per_picowatt):
 
 
 def normalize_pixels_sum1(pixels):
-    """Нормализует матрицу в диапазон [0, 1] с суммой элементов 1."""
+    """Нормализует матрицу в диапазон [0, 1] с суммой элементов 1.
+
+    Эта функция оставлена для совместимости со старым методом, где из ROI
+    дополнительно вычитался минимум. Для проверки идеальной синтетической
+    гауссоиды лучше использовать normalize_signal_sum1(), чтобы не искажать
+    форму ненулевых хвостов гауссианы.
+    """
     pixels = np.asarray(pixels, dtype=float)
     pixels = pixels - np.min(pixels)
     max_val = np.max(pixels)
@@ -25,6 +31,15 @@ def normalize_pixels_sum1(pixels):
     total = np.sum(pixels)
     if total > 0:
         pixels = pixels / total
+    return pixels
+
+
+def normalize_signal_sum1(pixels):
+    """Нормализует неотрицательный сигнал только по сумме без вычитания минимума."""
+    pixels = np.clip(np.asarray(pixels, dtype=float), 0.0, None)
+    total = np.sum(pixels)
+    if total > 0:
+        return pixels / total
     return pixels
 
 

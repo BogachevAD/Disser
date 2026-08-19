@@ -6,6 +6,7 @@
 
 from gaussian_app import run_gaussian_simulator
 
+
 # === Размер кадра и положение пятна ===
 WIDTH = 32
 HEIGHT = 32
@@ -16,6 +17,8 @@ SIGMA_PX = 1.0
 # === Яркость в разрядах АЦП (LSB) ===
 ADC_BITS = 16
 MAX_ADC_CODE = 2**ADC_BITS - 1
+# AMPLITUDE_LSB — пиковая добавка гауссоиды над фоном.
+# BACKGROUND_LSB — постоянный уровень фона каждого пикселя.
 AMPLITUDE_LSB = 30000.0
 BACKGROUND_LSB = 1000.0
 
