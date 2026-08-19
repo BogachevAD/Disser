@@ -6,7 +6,6 @@
 
 from gaussian_app import run_gaussian_simulator
 
-
 # === Размер кадра и положение пятна ===
 WIDTH = 32
 HEIGHT = 32
@@ -20,12 +19,13 @@ MAX_ADC_CODE = 2**ADC_BITS - 1
 # AMPLITUDE_LSB — пиковая добавка гауссоиды над фоном.
 # BACKGROUND_LSB — постоянный уровень фона каждого пикселя.
 AMPLITUDE_LSB = 30000.0
-BACKGROUND_LSB = 1000.0
+BACKGROUND_LSB = 0.0
 
 # === Шумы в разрядах АЦП (LSB, стандартное отклонение) ===
-TEMPORAL_NOISE_LSB = 50.0
-GEOMETRIC_NOISE_LSB = 20.0
+TEMPORAL_NOISE_LSB = 0.0
+GEOMETRIC_NOISE_LSB = 0.0
 FIX_GEOMETRIC_NOISE = True
+# GEOMETRIC_SEED задает воспроизводимую карту фиксированного геометрического шума.
 GEOMETRIC_SEED = 42
 
 # === Пересчет единиц ===
