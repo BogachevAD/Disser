@@ -7,6 +7,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSpinBox,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -29,22 +31,15 @@ from gaussian_math import crop_around_max, fit_gaussian_weighted, lsb_to_watts, 
 class GaussianFrameSimulator:
     """Состояние модели кадра с временным и фиксируемым геометрическим шумом."""
 
-    geometric_seed: int = 42
     geometric_noise: np.ndarray | None = None
-    frame_index: int = 0
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
 
-    def reset_geometric_noise(self):
+    def clear_geometric_noise(self):
         self.geometric_noise = None
 
-    def set_geometric_seed(self, seed):
-        """Меняет seed геометрического шума и сбрасывает сохраненную карту шума."""
-        if self.geometric_seed != seed:
-            self.geometric_seed = seed
-            self.reset_geometric_noise()
-
-    def next_frame(self):
-        self.frame_index += 1
+    def generate_geometric_noise(self, shape, geometric_noise_lsb):
+        """Создает новую карту геометрического шума для текущего размера кадра."""
+        self.geometric_noise = self.rng.normal(0.0, geometric_noise_lsb, shape)
 
     def simulate(self, width, height, x0, y0, sigma, amplitude_lsb, background_lsb,
                  temporal_noise_lsb, geometric_noise_lsb, fix_geometric_noise, adc_bits):
@@ -62,8 +57,7 @@ class GaussianFrameSimulator:
 
         if fix_geometric_noise:
             if self.geometric_noise is None or self.geometric_noise.shape != shape:
-                geom_rng = np.random.default_rng(self.geometric_seed)
-                self.geometric_noise = geom_rng.normal(0.0, geometric_noise_lsb, shape)
+                self.generate_geometric_noise(shape, geometric_noise_lsb)
             geometric = self.geometric_noise
         else:
             geometric = self.rng.normal(0.0, geometric_noise_lsb, shape)
@@ -76,17 +70,34 @@ class GaussianFrameSimulator:
 class GaussianSimulatorWindow(QMainWindow):
     """Аккуратное PyQt-окно с числовыми полями и тремя графиками."""
 
+    FRAME_FIELDS = [
+        ("width", "Ширина, px", "WIDTH", 3, 4096, 1, int),
+        ("height", "Высота, px", "HEIGHT", 3, 4096, 1, int),
+        ("lsb_per_picowatt", "LSB/пВт", "LSB_PER_PICOWATT", 0.000001, 1000000.0, 1.0, float),
+    ]
+    GAUSSIAN_FIELDS = [
+        ("x0", "X0, px", "X0", 0.0, 4095.0, 0.1, float),
+        ("y0", "Y0, px", "Y0", 0.0, 4095.0, 0.1, float),
+        ("sigma", "Sigma, px", "SIGMA_PX", 0.05, 200.0, 0.05, float),
+        ("amplitude_lsb", "Амплитуда, LSB", "AMPLITUDE_LSB", 0.0, "MAX_ADC_CODE", 1.0, float),
+        ("background_lsb", "Фон, LSB", "BACKGROUND_LSB", 0.0, "MAX_ADC_CODE", 1.0, float),
+    ]
+    NOISE_FIELDS = [
+        ("temporal_noise_lsb", "Временной σ, LSB", "TEMPORAL_NOISE_LSB", 0.0, 100000.0, 1.0, float),
+        ("geometric_noise_lsb", "Геометрический σ, LSB", "GEOMETRIC_NOISE_LSB", 0.0, 100000.0, 1.0, float),
+    ]
+
     def __init__(self, config):
         super().__init__()
         self.config = dict(config)
-        self.simulator = GaussianFrameSimulator(geometric_seed=self.config["GEOMETRIC_SEED"])
+        self.simulator = GaussianFrameSimulator()
         self.last_frame = None
         self.last_roi = None
         self.last_roi_without_background = None
         self.last_fit = None
         self.inputs = {}
         self.setWindowTitle("Модель гауссова кадра")
-        self.resize(1500, 900)
+        self.resize(1500, 950)
         self._build_ui()
         self.update_model(run_fit=True)
 
@@ -94,59 +105,27 @@ class GaussianSimulatorWindow(QMainWindow):
         root = QWidget(self)
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(10)
+        root_layout.setSpacing(8)
 
-        controls = QGroupBox("Параметры модели")
-        controls_layout = QGridLayout(controls)
-        controls_layout.setHorizontalSpacing(18)
-        controls_layout.setVerticalSpacing(8)
-        root_layout.addWidget(controls)
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(10)
+        root_layout.addLayout(controls_row)
+        self._add_group(controls_row, "Кадр и пересчет", self.FRAME_FIELDS)
+        self._add_group(controls_row, "Гауссоида", self.GAUSSIAN_FIELDS)
+        noise_group = self._add_group(controls_row, "Шумы", self.NOISE_FIELDS)
 
-        field_specs = [
-            ("width", "Ширина, px", "WIDTH", 3, 4096, 1, int),
-            ("height", "Высота, px", "HEIGHT", 3, 4096, 1, int),
-            ("x0", "X0, px", "X0", 0.0, 4095.0, 0.1, float),
-            ("y0", "Y0, px", "Y0", 0.0, 4095.0, 0.1, float),
-            ("sigma", "Sigma, px", "SIGMA_PX", 0.05, 200.0, 0.05, float),
-            ("amplitude_lsb", "Амплитуда пика, LSB", "AMPLITUDE_LSB", 0.0, self.config["MAX_ADC_CODE"], 1.0, float),
-            ("background_lsb", "Фон пикселя, LSB", "BACKGROUND_LSB", 0.0, self.config["MAX_ADC_CODE"], 1.0, float),
-            ("temporal_noise_lsb", "Временной шум σ, LSB", "TEMPORAL_NOISE_LSB", 0.0, 100000.0, 1.0, float),
-            ("geometric_noise_lsb", "Геометрический шум σ, LSB", "GEOMETRIC_NOISE_LSB", 0.0, 100000.0, 1.0, float),
-            ("geometric_seed", "Geometric seed", "GEOMETRIC_SEED", 0, 2**31 - 1, 1, int),
-            ("lsb_per_picowatt", "LSB/пВт", "LSB_PER_PICOWATT", 0.000001, 1000000.0, 1.0, float),
-        ]
-
-        columns = 4
-        for index, spec in enumerate(field_specs):
-            key, label, config_key, minimum, maximum, step, value_type = spec
-            row = index // columns
-            column = (index % columns) * 2
-            controls_layout.addWidget(QLabel(label), row, column)
-            widget = self._make_spin_box(value_type, minimum, maximum, step, self.config[config_key])
-            controls_layout.addWidget(widget, row, column + 1)
-            self.inputs[key] = widget
-            widget.valueChanged.connect(self._on_value_changed)
-
-        self.fix_geometric_checkbox = QCheckBox("Фиксировать геометрический шум")
+        noise_layout = noise_group.layout()
+        self.fix_geometric_checkbox = QCheckBox("Фиксировать текущий геометрический шум")
         self.fix_geometric_checkbox.setChecked(self.config["FIX_GEOMETRIC_NOISE"])
         self.fix_geometric_checkbox.setToolTip(
-            "Если включено, одна и та же карта геометрического шума используется во всех кадрах до сброса."
+            "Если включено, текущая карта геометрического шума остается одной и той же между пересчетами."
         )
         self.fix_geometric_checkbox.stateChanged.connect(self._on_fix_geometric_changed)
-        controls_layout.addWidget(self.fix_geometric_checkbox, 3, 0, 1, 2)
+        noise_layout.addWidget(self.fix_geometric_checkbox, 2, 0, 1, 2)
 
-        button_row = QHBoxLayout()
-        self.fit_button = QPushButton("Пересчитать sigma")
-        self.new_frame_button = QPushButton("Новый кадр")
-        self.reset_geom_button = QPushButton("Сброс геом. шума")
-        self.fit_button.clicked.connect(lambda: self.update_model(run_fit=True))
-        self.new_frame_button.clicked.connect(self._on_new_frame_clicked)
-        self.reset_geom_button.clicked.connect(self._on_reset_geom_clicked)
-        button_row.addWidget(self.fit_button)
-        button_row.addWidget(self.new_frame_button)
-        button_row.addWidget(self.reset_geom_button)
-        button_row.addStretch(1)
-        root_layout.addLayout(button_row)
+        self.generate_geom_button = QPushButton("Сгенерировать геометрический шум")
+        self.generate_geom_button.clicked.connect(self._on_generate_geometric_clicked)
+        noise_layout.addWidget(self.generate_geom_button, 3, 0, 1, 2)
 
         self.info_label = QLabel()
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -155,9 +134,47 @@ class GaussianSimulatorWindow(QMainWindow):
         self.figure = Figure(figsize=(14, 5), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
         root_layout.addWidget(self.canvas, stretch=1)
-        self.frame_axis, self.roi_axis, self.fit_axis = self.figure.subplots(1, 3)
+        self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis = self.figure.subplots(1, 4)
+
+        matrix_row = QHBoxLayout()
+        matrix_row.setSpacing(12)
+        root_layout.addLayout(matrix_row)
+        matrix_row.addStretch(1)
+        self.roi_matrix = self._make_matrix_box("Матрица изображения 2")
+        self.fit_matrix = self._make_matrix_box("Матрица изображения 3")
+        self.model_matrix = self._make_matrix_box("Матрица изображения 4")
+        matrix_row.addWidget(self.roi_matrix)
+        matrix_row.addWidget(self.fit_matrix)
+        matrix_row.addWidget(self.model_matrix)
+        matrix_row.addStretch(1)
 
         self.setCentralWidget(root)
+
+    def _add_group(self, parent_layout, title, fields):
+        group = QGroupBox(title)
+        layout = QGridLayout(group)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(5)
+        parent_layout.addWidget(group)
+        for row, spec in enumerate(fields):
+            key, label, config_key, minimum, maximum, step, value_type = spec
+            if maximum == "MAX_ADC_CODE":
+                maximum = self.config["MAX_ADC_CODE"]
+            layout.addWidget(QLabel(label), row, 0)
+            widget = self._make_spin_box(value_type, minimum, maximum, step, self.config[config_key])
+            layout.addWidget(widget, row, 1)
+            self.inputs[key] = widget
+            widget.valueChanged.connect(self._on_value_changed)
+        return group
+
+    def _make_matrix_box(self, title):
+        box = QTextEdit()
+        box.setReadOnly(True)
+        box.setFixedHeight(95)
+        box.setMinimumWidth(330)
+        box.setFont(QFont("Courier New", 10))
+        box.setText(title)
+        return box
 
     def _make_spin_box(self, value_type, minimum, maximum, step, value):
         if value_type is int:
@@ -169,10 +186,11 @@ class GaussianSimulatorWindow(QMainWindow):
             spin_box = QDoubleSpinBox()
             spin_box.setRange(float(minimum), float(maximum))
             spin_box.setSingleStep(float(step))
-            spin_box.setDecimals(6)
+            spin_box.setDecimals(3)
             spin_box.setValue(float(value))
         spin_box.setKeyboardTracking(False)
-        spin_box.setMinimumWidth(130)
+        spin_box.setMinimumWidth(88)
+        spin_box.setMaximumWidth(105)
         return spin_box
 
     def _params(self):
@@ -190,14 +208,12 @@ class GaussianSimulatorWindow(QMainWindow):
             "background_lsb": min(max(float(self.inputs["background_lsb"].value()), 0.0), max_code),
             "temporal_noise_lsb": max(float(self.inputs["temporal_noise_lsb"].value()), 0.0),
             "geometric_noise_lsb": max(float(self.inputs["geometric_noise_lsb"].value()), 0.0),
-            "geometric_seed": int(self.inputs["geometric_seed"].value()),
             "adc_bits": adc_bits,
             "lsb_per_picowatt": max(float(self.inputs["lsb_per_picowatt"].value()), 1e-12),
         }
 
     def update_model(self, run_fit=False):
         params = self._params()
-        self.simulator.set_geometric_seed(params["geometric_seed"])
         self.last_frame = self.simulator.simulate(
             params["width"], params["height"], params["x0"], params["y0"], params["sigma"],
             params["amplitude_lsb"], params["background_lsb"], params["temporal_noise_lsb"],
@@ -210,41 +226,71 @@ class GaussianSimulatorWindow(QMainWindow):
         self._draw(params, max_x, max_y)
 
     def _draw(self, params, max_x, max_y):
-        for axis in (self.frame_axis, self.roi_axis, self.fit_axis):
+        for axis in (self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis):
             axis.clear()
 
         self.frame_axis.imshow(self.last_frame, cmap="gray", vmin=0, vmax=2**params["adc_bits"] - 1)
-        self.frame_axis.set_title("Зашумленный кадр, LSB")
+        self.frame_axis.set_title("1. Зашумленный кадр, LSB")
 
-        self.roi_axis.imshow(self.last_roi_without_background, cmap="gray")
-        self.roi_axis.set_title("Обрезка 3×3, фон вычтен")
+        vmin = float(np.min(self.last_roi_without_background))
+        vmax = float(np.max(self.last_roi_without_background))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        self.roi_axis.imshow(self.last_roi_without_background, cmap="gray", vmin=vmin, vmax=vmax)
+        self.roi_axis.set_title("2. Обрезка 3×3, фон вычтен")
 
-        self.fit_axis.imshow(self.last_fit["model"], cmap="gray")
-        self.fit_axis.set_title(f"Расчет: σ={self.last_fit['sigma']:.3f} px")
-        circle = patches.Circle(
-            (self.last_fit["x0"], self.last_fit["y0"]),
-            self.last_fit["sigma"],
-            edgecolor="r",
-            facecolor="none",
-            linestyle="--",
-        )
-        self.fit_axis.add_patch(circle)
+        self.fit_axis.imshow(self.last_roi_without_background, cmap="gray", vmin=vmin, vmax=vmax)
+        self.fit_axis.set_title(f"3. Та же обрезка + σ={self.last_fit['sigma']:.3f} px")
+        self._draw_fit_overlay()
 
-        for axis in (self.frame_axis, self.roi_axis, self.fit_axis):
+        model = self.last_fit["model"]
+        model_vmin = float(np.min(model))
+        model_vmax = float(np.max(model))
+        if model_vmax <= model_vmin:
+            model_vmax = model_vmin + 1.0
+        self.model_axis.imshow(model, cmap="gray", vmin=model_vmin, vmax=model_vmax)
+        self.model_axis.set_title("4. Рассчитанная модель")
+
+        for axis in (self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis):
             axis.set_xticks([])
             axis.set_yticks([])
 
+        self._update_info(params, max_x, max_y)
+        matrix_text = self._format_matrix(self.last_roi_without_background)
+        self.roi_matrix.setText("Матрица изображения 2\n" + matrix_text)
+        self.fit_matrix.setText("Матрица изображения 3\n" + matrix_text)
+        self.model_matrix.setText("Матрица изображения 4\n" + self._format_matrix(model))
+        self.canvas.draw_idle()
+
+    def _draw_fit_overlay(self):
+        x0 = self.last_fit["x0"]
+        y0 = self.last_fit["y0"]
+        sigma = self.last_fit["sigma"]
+        self.fit_axis.plot(x0, y0, marker="x", color="red", markersize=7, mew=1.5)
+        circle = patches.Circle((x0, y0), sigma, edgecolor="red", facecolor="none", linestyle="--", linewidth=1.2)
+        self.fit_axis.add_patch(circle)
+        grid_step = 1.0 / 15.0
+        for index in range(16):
+            coord = 0.5 + index * grid_step
+            self.fit_axis.axvline(coord, ymin=1 / 3, ymax=2 / 3, color="cyan", linewidth=0.35, alpha=0.75)
+            self.fit_axis.axhline(coord, xmin=1 / 3, xmax=2 / 3, color="cyan", linewidth=0.35, alpha=0.75)
+
+    def _update_info(self, params, max_x, max_y):
         amp_watts = float(lsb_to_watts(params["amplitude_lsb"], params["lsb_per_picowatt"]))
         background_watts = float(lsb_to_watts(params["background_lsb"], params["lsb_per_picowatt"]))
         temporal_watts = float(lsb_to_watts(params["temporal_noise_lsb"], params["lsb_per_picowatt"]))
+        geometric_watts = float(lsb_to_watts(params["geometric_noise_lsb"], params["lsb_per_picowatt"]))
         self.info_label.setText(
-            f"Кадр {self.simulator.frame_index}; максимум x={max_x}, y={max_y}; "
-            f"амплитуда пика={amp_watts:.3e} Вт; фон/пиксель={background_watts:.3e} Вт; "
-            f"временной шум σ={temporal_watts:.3e} Вт; "
-            f"geometric_seed={params['geometric_seed']}; "
-            f"геом. шум {'фиксирован' if self.fix_geometric_checkbox.isChecked() else 'меняется'}"
+            f"max: x={max_x}, y={max_y}; "
+            f"амплитуда={params['amplitude_lsb']:.3f} LSB ({amp_watts:.3e} Вт); "
+            f"фон={params['background_lsb']:.3f} LSB ({background_watts:.3e} Вт); "
+            f"временной σ={params['temporal_noise_lsb']:.3f} LSB ({temporal_watts:.3e} Вт); "
+            f"геометрический σ={params['geometric_noise_lsb']:.3f} LSB ({geometric_watts:.3e} Вт); "
+            f"геом. шум {'зафиксирован' if self.fix_geometric_checkbox.isChecked() else 'перегенерируется'}"
         )
-        self.canvas.draw_idle()
+
+    def _format_matrix(self, matrix):
+        return "\n".join("  ".join(f"{value:10.3f}" for value in row) for row in matrix)
 
     def _on_value_changed(self):
         self.last_fit = None
@@ -252,17 +298,14 @@ class GaussianSimulatorWindow(QMainWindow):
 
     def _on_fix_geometric_changed(self):
         if not self.fix_geometric_checkbox.isChecked():
-            self.simulator.reset_geometric_noise()
+            self.simulator.clear_geometric_noise()
         self.last_fit = None
         self.update_model(run_fit=True)
 
-    def _on_new_frame_clicked(self):
-        self.simulator.next_frame()
-        self.last_fit = None
-        self.update_model(run_fit=True)
-
-    def _on_reset_geom_clicked(self):
-        self.simulator.reset_geometric_noise()
+    def _on_generate_geometric_clicked(self):
+        params = self._params()
+        self.simulator.generate_geometric_noise((params["height"], params["width"]), params["geometric_noise_lsb"])
+        self.fix_geometric_checkbox.setChecked(True)
         self.last_fit = None
         self.update_model(run_fit=True)
 

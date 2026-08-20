@@ -25,8 +25,6 @@ BACKGROUND_LSB = 0.0
 TEMPORAL_NOISE_LSB = 0.0
 GEOMETRIC_NOISE_LSB = 0.0
 FIX_GEOMETRIC_NOISE = True
-# GEOMETRIC_SEED задает воспроизводимую карту фиксированного геометрического шума.
-GEOMETRIC_SEED = 42
 
 # === Пересчет единиц ===
 # По умолчанию: 60 младших разрядов = 1 пикоВатт.
@@ -45,7 +43,6 @@ CONFIG = {
     "TEMPORAL_NOISE_LSB": TEMPORAL_NOISE_LSB,
     "GEOMETRIC_NOISE_LSB": GEOMETRIC_NOISE_LSB,
     "FIX_GEOMETRIC_NOISE": FIX_GEOMETRIC_NOISE,
-    "GEOMETRIC_SEED": GEOMETRIC_SEED,
     "LSB_PER_PICOWATT": LSB_PER_PICOWATT,
 }
 
