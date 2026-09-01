@@ -1,468 +1,209 @@
-import numpy as np
-#import cv2
-import matplotlib.pyplot as plt
-import os
-import ipywidgets as widgets
-from IPython.display import display
-from scipy.optimize import curve_fit
-from scipy.ndimage import zoom
-from PIL import Image
-from scipy.signal import fftconvolve
-from scipy.fft import fft2, ifft2, fftshift
-from scipy.ndimage import gaussian_filter
-from scipy.signal import fftconvolve
-from scipy.optimize import minimize
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import convolve2d as conv2
-from skimage import color, data, restoration
-from scipy.optimize import curve_fit
-from skimage.restoration import richardson_lucy
-from scipy.signal import convolve2d
-from scipy.ndimage import convolve
-from mpl_toolkits.mplot3d import Axes3D
-from IPython.display import display, HTML
-import pandas as pd
-import ipywidgets as widgets
-import plotly.graph_objects as go
-from IPython.display import display
-import ipywidgets as widgets
-from scipy.interpolate import griddata
-import numpy as np
-from scipy.optimize import minimize
-from scipy.special import erf
-from tkinter import Tk, filedialog
-import ipywidgets as widgets
-from IPython.display import display
-import io
+"""Анализ экспериментального кадра и вспомогательная модель дальности.
+
+Файл сохранён как отдельный исследовательский сценарий: он читает текстовую
+матрицу, оценивает фон по кольцу, подгоняет пиксельно-интегрированную гауссиану
+и строит диагностические изображения. Жёстких локальных путей и выполнения при
+импорте нет; путь к измерению передаётся через командную строку.
+"""
+
+import argparse
+from pathlib import Path
+
 import matplotlib.patches as patches
-from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-import os
+import matplotlib.pyplot as plt
+import numpy as np
+
+from gaussian_math import crop_around_max, crop_around_pixel, fit_gaussian_weighted, local_to_global
 
 
-def normalize_data(pixels):
-    """Нормировка яркости так, чтобы сумма была равна 1"""
-    pixels = np.array(pixels, dtype=float)
-    return pixels / pixels.sum()
+def estimate_background_annulus(image, center_x, center_y, inner_size=3, outer_size=9):
+    """Оценивает постоянный фон по квадратному кольцу вокруг цели.
 
-
-def gaussian_pixel_integral(x0, y0, sigma, i, j):
+    image — кадр, center_x/center_y — пиксель цели; inner_size исключает сигнал,
+    outer_size задаёт внешнюю границу. Возвращается медиана кольца, устойчивая
+    к одиночным выбросам и дефектным пикселям.
     """
-    Интеграл гауссианы по площади пикселя (i,j).
-    Считаем, что пиксели имеют координаты с центрами в целых числах,
-    а их границы: [i-0.5, i+0.5], [j-0.5, j+0.5].
+    if inner_size <= 0 or outer_size <= inner_size or inner_size % 2 == 0 or outer_size % 2 == 0:
+        raise ValueError("inner_size и outer_size должны быть нечётными, outer_size > inner_size")
+    window, _, _ = crop_around_pixel(image, center_x, center_y, outer_size)
+    center = outer_size // 2
+    y, x = np.indices(window.shape)
+    chebyshev_radius = np.maximum(np.abs(x - center), np.abs(y - center))
+    mask = chebyshev_radius > inner_size // 2
+    return float(np.median(window[mask]))
+
+
+def analyze_measurement(file_path, border=5, roi_size=3, background_window=9, show_plots=True):
+    """Выполняет полный анализ текстовой матрицы экспериментального кадра.
+
+    file_path указывает файл np.loadtxt; border удаляет краевые строки/столбцы;
+    roi_size и background_window задают окно ФРТ и оценки фона. Возвращаемый
+    словарь содержит исходные данные, ROI, фон, fit и глобальные координаты.
     """
+    file_path = Path(file_path)
+    data = np.loadtxt(file_path)
+    if data.ndim != 2 or min(data.shape) <= 2 * border:
+        raise ValueError("Файл должен содержать двумерную матрицу больше удаляемой границы")
 
-    def phi(t):
-        return 0.5 * (1 + erf(t / (np.sqrt(2) * sigma)))
+    # Подготовка кадра: удаляем ненадёжную границу и находим кандидат по максимуму.
+    cropped = data[border:-border, border:-border] if border else data.copy()
+    roi, center_x, center_y = crop_around_max(cropped, roi_size)
 
-    x1, x2 = i - 0.5, i + 0.5
-    y1, y2 = j - 0.5, j + 0.5
+    # Радиометрическая коррекция: медианный фон кольца вычитается из ROI.
+    background = estimate_background_annulus(
+        cropped, center_x, center_y, inner_size=roi_size, outer_size=background_window
+    )
+    corrected_roi = np.clip(roi - background, 0.0, None)
 
-    return (phi(x2 - x0) - phi(x1 - x0)) * (phi(y2 - y0) - phi(y1 - y0))
+    # Субпиксельная оценка: локальный fit переводится в координаты cropped и data.
+    fit = fit_gaussian_weighted(corrected_roi)
+    roi_origin_x = center_x - roi_size // 2
+    roi_origin_y = center_y - roi_size // 2
+    fitted_x, fitted_y = local_to_global(fit["x0"], fit["y0"], roi_origin_x, roi_origin_y)
+    fitted_x_source, fitted_y_source = fitted_x + border, fitted_y + border
 
-
-def model_image(shape, x0, y0, sigma):
-    """Модельное распределение для матрицы пикселей shape=(ny,nx)"""
-    ny, nx = shape
-    g = np.zeros((ny, nx))
-    for j in range(ny):
-        for i in range(nx):
-            g[j, i] = gaussian_pixel_integral(x0, y0, sigma, i, j)
-    return g / g.sum()  # нормировка на 1
-
-
-def fit_gaussian(pixels):
-    """Подгонка параметров (x0, y0, sigma) под данные"""
-    data = normalize_data(pixels)
-    ny, nx = data.shape
-
-    # Начальные приближения
-    x0_init, y0_init = nx / 2, ny / 2
-    sigma_init = 1.0
-
-    def loss(params):
-        x0, y0, sigma = params
-        if sigma <= 0:
-            return np.inf
-        model = model_image((ny, nx), x0, y0, sigma)
-        return np.sum((data - model) ** 2)
-
-    res = minimize(loss, [x0_init, y0_init, sigma_init],
-                   method="Nelder-Mead")
-    x0, y0, sigma = res.x
-    return {"x0": x0, "y0": y0, "sigma": sigma, "success": res.success, "loss": res.fun}
-
-
-def fit_gaussian_with_model(pixels):
-    """
-    Подгонка 2D гауссианы под матрицу пикселей.
-
-    Возвращает:
-    - params: x0, y0, sigma
-    - model: матрица гауссианы по пикселям (нормализованная)
-    """
-    data = normalize_data(pixels)
-    ny, nx = data.shape
-
-    # Начальные приближения
-    x0_init, y0_init = nx / 2, ny / 2
-    sigma_init = 1.0
-
-    def loss(params):
-        x0, y0, sigma = params
-        if sigma <= 0:
-            return np.inf
-        model = model_image((ny, nx), x0, y0, sigma)
-        return np.sum((data - model) ** 2)
-
-    # Оптимизация
-    res = minimize(loss, [x0_init, y0_init, sigma_init], method="Nelder-Mead")
-    x0, y0, sigma = res.x
-
-    # Строим модель с оптимальными параметрами
-    model = model_image((ny, nx), x0, y0, sigma)
-
-    return {
-        "x0": x0,
-        "y0": y0,
-        "sigma": sigma,
-        "success": res.success,
-        "loss": res.fun,
-        "model": model
+    result = {
+        "file_path": file_path,
+        "data": data,
+        "cropped": cropped,
+        "roi": roi,
+        "corrected_roi": corrected_roi,
+        "background": background,
+        "center_pixel": (center_x, center_y),
+        "fitted_center_cropped": (fitted_x, fitted_y),
+        "fitted_center_source": (fitted_x_source, fitted_y_source),
+        "fit": fit,
     }
+    if show_plots:
+        plot_measurement_analysis(result)
+    return result
 
 
-def fit_gaussian_central(pixels):
+def plot_measurement_analysis(result):
+    """Строит ROI измерения и восстановленную модель в общей шкале LSB.
+
+    result передаётся из analyze_measurement(). Первая ось показывает найденный
+    центр и окружность sigma, вторая — модель; одинаковые vmin/vmax позволяют
+    визуально сравнивать отсчёты без автоматического изменения контраста.
     """
-    Подгонка 2D гауссианы под матрицу пикселей.
-    Центральная точка будет идеально совпадать по амплитуде.
+    roi = result["corrected_roi"]
+    fit = result["fit"]
+    vmin, vmax = float(np.min(roi)), float(np.max(roi))
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
-    Возвращает:
-    - params: x0, y0, sigma, A
-    - model: матрица гауссианы по пикселям
-    - abs_errors: матрица абсолютных ошибок
+    figure, (roi_axis, model_axis) = plt.subplots(1, 2, figsize=(9, 4), constrained_layout=True)
+    roi_axis.imshow(roi, cmap="gray", interpolation="nearest", vmin=vmin, vmax=vmax)
+    roi_axis.plot(fit["x0"], fit["y0"], "rx", markersize=7, label="Оценённый центр")
+    roi_axis.add_patch(
+        patches.Circle(
+            (fit["x0"], fit["y0"]), fit["sigma"], edgecolor="red",
+            facecolor="none", linestyle="--", linewidth=1.2, label="σ",
+        )
+    )
+    roi_axis.set_title("Экспериментальный ROI, фон вычтен")
+    roi_axis.legend()
+    model_axis.imshow(fit["model_signal"], cmap="gray", interpolation="nearest", vmin=vmin, vmax=vmax)
+    model_axis.set_title("Пиксельно-интегрированная модель")
+    plt.show()
+
+
+def E_h2(distance_km, source_parameter):
+    """Вычисляет освещённость на входном зрачке по эмпирической модели.
+
+    distance_km — дальность в километрах, source_parameter — агрегированный
+    параметр источника DI. Формула сохранена из исходного исследования и требует
+    отдельного физического обоснования единиц перед включением в диссертацию.
     """
-    pixels = np.array(pixels, dtype=float)
-    ny, nx = pixels.shape
-
-    # Начальные приближения
-    x0_init, y0_init = nx / 2, ny / 2
-    sigma_init = 1.0
-
-    def loss(params):
-        """Функция ошибки для оптимизации (без амплитуды)"""
-        x0, y0, sigma = params
-        if sigma <= 0:
-            return np.inf
-        model = model_image((ny, nx), x0, y0, sigma)
-        # Минимизируем суммарную ошибку по всем пикселям
-        return np.sum((pixels - model) ** 2)
-
-    # Оптимизация
-    res = minimize(loss, [x0_init, y0_init, sigma_init], method="Nelder-Mead")
-    x0, y0, sigma = res.x
-
-    # Вычисляем амплитуду так, чтобы центральный пиксель совпадал
-    yc, xc = ny // 2, nx // 2
-    central_value = pixels[yc, xc]
-    central_gauss = model_image((ny, nx), x0, y0, sigma)[yc, xc]
-    A = central_value / central_gauss
-
-    # Строим окончательную модель
-    model = A * model_image((ny, nx), x0, y0, sigma)
-
-    # Матрица абсолютных ошибок
-    abs_errors = np.abs(pixels - model)
-
-    return {
-        "x0": x0,
-        "y0": y0,
-        "sigma": sigma,
-        "A": A,
-        "success": res.success,
-        "loss": res.fun,
-        "model": model,
-        "abs_errors": abs_errors
-    }
+    distance_km = np.asarray(distance_km, dtype=float)
+    inverse_square = source_parameter / ((distance_km * 1e5) ** 2)
+    transmission = 10 ** (
+        -0.6 - distance_km / 190 + np.exp(-((distance_km + 43) / 47) ** 2.9)
+    ) - 0.04
+    return inverse_square * transmission
 
 
-def fit_gaussian_weighted(pixels):
+def snr_from_D(distance_km, source_parameter, gain=1.0, noise_sigma=1.0):
+    """Переводит освещённость E_h2 в линейное отношение сигнал/шум.
+
+    gain объединяет усиление тракта, noise_sigma — СКО шума в согласованных
+    единицах. Отрицательная часть эмпирической освещённости ограничивается нулём.
     """
-    Подгонка 2D гауссианы под матрицу пикселей с учётом весов.
-    Центральная точка будет идеально совпадать по амплитуде.
-    Чем ярче пиксель, тем выше его вес.
+    if noise_sigma <= 0:
+        raise ValueError("noise_sigma должна быть положительной")
+    irradiance = np.maximum(E_h2(distance_km, source_parameter), 0.0)
+    return gain * irradiance / noise_sigma
 
-    Возвращает:
-    - params: x0, y0, sigma, A
-    - model: матрица гауссианы по пикселям
-    - abs_errors: матрица абсолютных ошибок
+
+def Dmax_from_snr_threshold(
+    snr_threshold, source_parameter, gain=1.0, noise_sigma=1.0,
+    distance_min=0.1, distance_max=120.0, grid_size=20_000,
+):
+    """Ищет максимальную дальность, где SNR не ниже заданного порога.
+
+    Параметры задают порог, источник, тракт, шум и равномерную сетку дальности.
+    Возвращается последняя допустимая дальность или NaN, если порог недостижим.
     """
-    pixels = np.array(pixels, dtype=float)
-    ny, nx = pixels.shape
-
-    # Вес пикселя пропорционален его значению
-    # Можно добавить небольшую константу, чтобы тёмные пиксели тоже учитывались
-    W = pixels
-
-    # Начальные приближения
-    x0_init, y0_init = nx / 2, ny / 2
-    sigma_init = 1.0
-
-    def loss(params):
-        x0, y0, sigma = params
-        if sigma <= 0:
-            return np.inf
-        model = model_image((ny, nx), x0, y0, sigma)
-        # Взвешенная функция ошибки
-        return np.sum(W * (pixels - model) ** 2)
-
-    # Оптимизация
-    res = minimize(loss, [x0_init, y0_init, sigma_init], method="Nelder-Mead")
-    x0, y0, sigma = res.x
-
-    # Амплитуда для центрального пикселя
-    yc, xc = ny // 2, nx // 2
-    central_value = pixels[yc, xc]
-    central_gauss = model_image((ny, nx), x0, y0, sigma)[yc, xc]
-    A = central_value / central_gauss
-
-    # Финальная модель
-    model = A * model_image((ny, nx), x0, y0, sigma)
-
-    # Абсолютная погрешность
-    abs_errors = np.abs(pixels - model)
-
-    return {
-        "x0": x0,
-        "y0": y0,
-        "sigma": sigma,
-        "A": A,
-        "success": res.success,
-        "loss": res.fun,
-        "model": model,
-        "abs_errors": abs_errors,
-        "weights": W
-    }
+    distance_grid = np.linspace(distance_min, distance_max, grid_size)
+    snr_grid = snr_from_D(distance_grid, source_parameter, gain, noise_sigma)
+    valid = np.flatnonzero(snr_grid >= snr_threshold)
+    return np.nan if valid.size == 0 else float(distance_grid[valid[-1]])
 
 
-def normalize_pixels_sum1(pixels):
+def plot_Dmax_vs_SNR(
+    source_parameter, gain=1.0, noise_sigma=1.0,
+    snr_min_db=-10.0, snr_max_db=30.0, points=120,
+):
+    """Строит зависимость предельной дальности от требуемого SNR.
+
+    Диапазон snr_min_db…snr_max_db переводится в линейные значения; для каждого
+    порога вызывается Dmax_from_snr_threshold(), после чего строится график.
     """
-    Нормализует матрицу пикселей так, чтобы:
-    1. Все значения были в диапазоне [0, 1]
-    2. Сумма всех элементов была равна 1
-    """
-    pixels = np.array(pixels, dtype=float)
-
-    # сдвиг к нулю, если есть отрицательные
-    pixels = pixels - pixels.min()
-
-    # нормализация диапазона к [0, 1]
-    max_val = pixels.max()
-    if max_val > 0:
-        pixels = pixels / max_val
-
-    # нормализация суммы к 1
-    total = pixels.sum()
-    if total > 0:
-        pixels = pixels / total
-
-    return pixels
-
-
-# ==== функции для оформления ====
-def set_font(run, font_name="Times New Roman", size=12):
-    run.font.name = font_name
-    run.font.size = Pt(size)
-
-
-def add_matrix_table(doc, matrix, title):
-    """Добавляет таблицу с матрицей"""
-    p = doc.add_paragraph(title)
-    set_font(p.runs[0])
-    table = doc.add_table(rows=matrix.shape[0], cols=matrix.shape[1])
-    table.style = "Table Grid"
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            cell = table.cell(i, j)
-            cell.text = f"{matrix[i, j]:.3f}"
-            for par in cell.paragraphs:
-                par.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in par.runs:
-                    set_font(run)
-
-
-def add_params_table(doc, params_dict):
-    """Добавляет таблицу параметров гауссианы"""
-    p = doc.add_paragraph("Параметры гауссианы:")
-    set_font(p.runs[0])
-    table = doc.add_table(rows=len(params_dict), cols=2)
-    table.style = "Table Grid"
-    for i, (key, value) in enumerate(params_dict.items()):
-        table.cell(i, 0).text = key
-        table.cell(i, 1).text = f"{value:.3f}" if isinstance(value, (int, float, np.floating)) else str(value)
-        for j in range(2):
-            for par in table.cell(i, j).paragraphs:
-                par.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in par.runs:
-                    set_font(run)
-
-
-def add_centered_image_with_caption(doc, img_path, caption_text, width=Inches(3.5)):
-    """Вставляет изображение по центру с подписью"""
-    p = doc.add_paragraph()
-    r = p.add_run()
-    r.add_picture(img_path, width=width)
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # подпись
-    p_caption = doc.add_paragraph(caption_text)
-    for run in p_caption.runs:
-        set_font(run)
-    p_caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-
-def E_h2(D, DI):
-    """Освещенность на зрачке от дальности D (км)."""
-    term1 = DI / ((D * 1e5) ** 2)
-    term2 = 10 ** (-0.6 - D / 190 + np.exp(-((D + 43) / 47) ** 2.9)) - 0.04
-    return term1 * term2
-
-def snr_from_D(D, DI, K=1.0, sigma_n=1.0):
-    # Чтобы не было отрицательных значений из-за '-0.04' в term2:
-    E = np.maximum(E_h2(D, DI), 0.0)
-    return K * E / sigma_n
-
-def Dmax_from_snr_threshold(snr_th, DI, K=1.0, sigma_n=1.0,
-                            D_min=0.1, D_max=120.0, n_grid=20000):
-    """
-    Максимальная дальность, где SNR(D) >= snr_th.
-    Поиск по плотной сетке (надежно и просто).
-    """
-    D_grid = np.linspace(D_min, D_max, n_grid)
-    snr_grid = snr_from_D(D_grid, DI=DI, K=K, sigma_n=sigma_n)
-
-    idx = np.where(snr_grid >= snr_th)[0]
-    if len(idx) == 0:
-        return np.nan
-    return D_grid[idx[-1]]  # самая дальняя точка, где порог еще выполняется
-
-def plot_Dmax_vs_SNR(DI, K=1.0, sigma_n=1.0,
-                     snr_min_db=-10, snr_max_db=30, n_points=120):
-    snr_db = np.linspace(snr_min_db, snr_max_db, n_points)
-    snr_lin = 10 ** (snr_db / 10.0)
-
-    Dmax = np.array([
-        Dmax_from_snr_threshold(s, DI=DI, K=K, sigma_n=sigma_n)
-        for s in snr_lin
+    snr_db = np.linspace(snr_min_db, snr_max_db, points)
+    snr_linear = 10 ** (snr_db / 10.0)
+    distances = np.array([
+        Dmax_from_snr_threshold(value, source_parameter, gain, noise_sigma)
+        for value in snr_linear
     ])
-
-    plt.figure(figsize=(8,5))
-    plt.plot(snr_db, Dmax, lw=2)
-    plt.xlabel('Требуемый порог SNR, дБ')
-    plt.ylabel('Максимальная дальность, км')
-    plt.title('Dmax(SNR) по модели E_h2(D, DI)')
+    plt.figure(figsize=(8, 5))
+    plt.plot(snr_db, distances, linewidth=2)
+    plt.xlabel("Требуемый порог SNR, дБ")
+    plt.ylabel("Максимальная дальность, км")
+    plt.title("Dmax(SNR) по эмпирической модели E_h2")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
-# === Шаг 1. Загружаем матрицу из файла ===
-filename = "C:/Users/Админ/Downloads/Test_image/Dump_Beo-M_MPO_MW_SRAM (1).txt"
-data = np.loadtxt(filename)
 
-print("Исходная матрица:", data.shape)
+def build_argument_parser():
+    """Создаёт CLI-парсер анализа экспериментального файла.
 
-# === Шаг 2. Обрезаем по 5 строк и столбцов с каждой стороны ===
-cropped = data[5:-5, 5:-5]
-print("После обрезки:", cropped.shape)
+    Входных переменных нет; возвращается ArgumentParser с четырьмя параметрами.
+    """
+    parser = argparse.ArgumentParser(description="Оценка гауссовой ФРТ по текстовой матрице")
+    parser.add_argument("file", type=Path, help="Путь к TXT-файлу, читаемому numpy.loadtxt")
+    parser.add_argument("--border", type=int, default=5, help="Число удаляемых краевых пикселей")
+    parser.add_argument("--roi-size", type=int, default=3, choices=(3, 5, 7), help="Размер ROI")
+    parser.add_argument("--background-window", type=int, default=9, help="Внешний размер фонового кольца")
+    return parser
 
-# === Шаг 3. Находим пиксель с максимальной яркостью ===
-y_max, x_max = np.unravel_index(np.argmax(cropped), cropped.shape)
-print("Максимум:", cropped[y_max, x_max], "в точке (y,x) =", (y_max, x_max))
 
-# === Шаг 4. Вырезаем окно 3x3 вокруг максимума ===
-y_start, y_end = max(0, y_max - 1), min(cropped.shape[0], y_max + 2)
-x_start, x_end = max(0, x_max - 1), min(cropped.shape[1], x_max + 2)
-roi = cropped[y_start:y_end, x_start:x_end]
+def main(argv=None):
+    """Разбирает argv, запускает анализ и печатает оценки.
 
-print("\nМатрица 3x3 вокруг ярчайшего пикселя:")
-print(roi)
+    argv — необязательный список CLI-аргументов; None использует sys.argv.
+    """
+    arguments = build_argument_parser().parse_args(argv)
+    result = analyze_measurement(
+        arguments.file, arguments.border, arguments.roi_size, arguments.background_window, True
+    )
+    fit = result["fit"]
+    print(f"Фон: {result['background']:.6g} LSB")
+    print(f"Центр в исходной матрице: ({result['fitted_center_source'][0]:.6f}, "
+          f"{result['fitted_center_source'][1]:.6f})")
+    print(f"Sigma: {fit['sigma']:.6f} px; success={fit['success']}; loss={fit['loss']:.6e}")
 
-# === Функция для выборки квадратов ===
-def get_ring(cropped, y_max, x_max, size):
-    """Возвращает квадрат size×size вокруг (y_max, x_max)."""
-    half = size // 2
-    y0, y1 = y_max - half, y_max + half + 1
-    x0, x1 = x_max - half, x_max + half + 1
-    return cropped[y0:y1, x0:x1]
 
-# квадрат 5x5
-win5 = get_ring(cropped, y_max, x_max, 5)
-ring5 = win5.copy()
-ring5[1:-1, 1:-1] = np.nan   # убираем 3x3
-
-# квадрат 9x9
-win9 = get_ring(cropped, y_max, x_max, 9)
-ring9 = win9.copy()
-ring9[2:-2, 2:-2] = np.nan   # убираем 5x5
-
-# собираем все значения, исключая nan
-background_pixels = np.concatenate([ring5[~np.isnan(ring5)], ring9[~np.isnan(ring9)]])
-background = np.mean(background_pixels)
-
-print("\nФон (усреднённое значение 18+56 пикселей):", background)
-
-# === Шаг 4.2. Вычитаем фон из 3x3 ===
-roi_corrected = roi - background
-print("\nМатрица 3x3 после вычитания фона:")
-print(roi_corrected)
-
-# === Шаг 5. Строим изображение именно для 3x3 ===
-plt.imshow(roi_corrected, cmap="gray", interpolation="nearest")
-plt.colorbar(label="Яркость (с вычетом фона)")
-plt.title("Фрагмент 3x3 вокруг максимума (фон вычтен)")
-plt.show()
-
-pixels = normalize_pixels_sum1(roi_corrected)
-result = fit_gaussian_weighted(pixels)
-
-print("Параметры гауссианы:")
-print("x0 =", result['x0'], "y0 =", result['y0'], "sigma =", result['sigma'], "A =", result['A'])
-
-print("\nМатрица модели:")
-print(result['model'])
-
-print("\nМатрица абсолютных ошибок:")
-print(result['abs_errors'])
-
-print("\nМатрица весов:")
-print(result['weights'])
-
-# === Визуализация центра гауссианы с окружностями ===
-plt.imshow(roi_corrected, cmap="gray", interpolation="nearest")
-plt.colorbar(label="Яркость (с вычетом фона)")
-plt.title("Фрагмент 3x3 с центром гауссианы")
-
-# Красная точка - центр
-plt.plot(result['x0'], result['y0'], 'ro', markersize=3, label="Центр гауссианы")
-
-# Добавляем окружности
-circle_params = [
-    (result['sigma'], 'r', "σ"),
-    (1.52 * result['sigma'], 'g', "1.52σ (≈80%)"),
-    (1.73 * result['sigma'], 'b', "1.73σ (≈90%)"),
-    (2.3  * result['sigma'], 'r', "2.3σ (≈99%)")
-]
-
-ax = plt.gca()
-for radius, color, label in circle_params:
-    circle = patches.Circle((result['x0'], result['y0']), radius,
-                            edgecolor=color, facecolor='none',
-                            linestyle='--', linewidth=1, label=label)
-    ax.add_patch(circle)
-
-plt.legend()
-plt.show()
+if __name__ == "__main__":
+    # Прямой запуск требует путь к измерению; импорт функций ничего не вычисляет.
+    main()
