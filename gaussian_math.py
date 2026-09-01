@@ -8,13 +8,14 @@
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import minimize
 from scipy.signal import fftconvolve
 from scipy.special import ndtr
 
 
 ROI_MODE_TRUTH = "truth"
 ROI_MODE_MATCHED_FILTER = "matched_filter"
+FIT_METHOD_NELDER_MEAD = "nelder_mead"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,20 @@ class RoiSelection:
     origin_y: int
     mode: str
     response: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class BackgroundStatistics:
+    """Статистика пиксельной рамки вокруг выбранного ROI.
+
+    mean/median — оценки уровня фона в LSB, std — выборочное СКО флуктуаций,
+    pixel_count — число реально использованных пикселей без дополнения границ.
+    """
+
+    mean: float
+    median: float
+    std: float
+    pixel_count: int
 
 
 def _as_valid_image(image, name="image"):
@@ -179,6 +194,46 @@ def crop_around_pixel(image, center_x, center_y, size=3):
     return crop, center_x - half, center_y - half
 
 
+def estimate_background_ring(
+    image, center_x, center_y, roi_size=3, ring_width=1, ring_gap=0,
+):
+    """Оценивает средний фон и его СКО по рамке вокруг ROI.
+
+    image — полный кадр, center_x/center_y — центральный пиксель ROI, roi_size —
+    его нечётный размер, ring_width — толщина рамки, ring_gap — защитный отступ
+    от ROI. Пиксели сигнала и отступа исключаются; у границы используются только
+    реальные элементы кадра. Отступ уменьшает попадание хвостов ФРТ в фон.
+    """
+    image = _as_valid_image(image)
+    _validate_odd_size(roi_size)
+    if not isinstance(ring_width, (int, np.integer)) or ring_width <= 0:
+        raise ValueError("ring_width должен быть положительным целым числом")
+    if not isinstance(ring_gap, (int, np.integer)) or ring_gap < 0:
+        raise ValueError("ring_gap должен быть неотрицательным целым числом")
+
+    center_x, center_y = int(center_x), int(center_y)
+    inner_half = roi_size // 2
+    ring_inner_radius = inner_half + int(ring_gap)
+    outer_half = ring_inner_radius + int(ring_width)
+    y0, y1 = max(0, center_y - outer_half), min(image.shape[0], center_y + outer_half + 1)
+    x0, x1 = max(0, center_x - outer_half), min(image.shape[1], center_x + outer_half + 1)
+    window = image[y0:y1, x0:x1]
+    global_y, global_x = np.indices(window.shape)
+    global_y += y0
+    global_x += x0
+    radius = np.maximum(np.abs(global_x - center_x), np.abs(global_y - center_y))
+    values = window[(radius > ring_inner_radius) & (radius <= outer_half)]
+    if values.size == 0:
+        raise ValueError("Рамка не содержит пикселей")
+    std = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+    return BackgroundStatistics(
+        mean=float(np.mean(values)),
+        median=float(np.median(values)),
+        std=std,
+        pixel_count=int(values.size),
+    )
+
+
 def crop_around_position(image, x0, y0, size=3):
     """Формирует ROI по известному непрерывному центру модели.
 
@@ -237,17 +292,31 @@ def select_roi(image, mode, size, x0, y0, sigma, background=0.0):
     raise ValueError(f"Неизвестный режим выбора ROI: {mode}")
 
 
-def fit_gaussian_weighted(pixels):
-    """Оценивает локальные x0, y0 и sigma по пиксельному ROI.
+def _prepare_fit_signal(pixels, background_level, subtract_background):
+    """Подготавливает сигнал ROI для алгоритма оценки.
 
-    pixels — сигнал после вычитания фона. Он нормируется по положительной сумме;
-    яркие элементы задают веса МНК. Ограниченный least_squares возвращает также
-    модель в относительных единицах и LSB, ошибку и статус оптимизатора.
+    pixels содержит исходные LSB; background_level — среднее рамки. При
+    subtract_background фон вычитается, после чего отрицательные шумовые
+    отклонения обнуляются для совместимости с яркостными весами старого метода.
     """
     pixels = _as_valid_image(pixels, "pixels")
-    positive_signal = np.clip(pixels, 0.0, None)
-    total_signal = float(np.sum(positive_signal))
-    normalized = normalize_signal_sum1(positive_signal)
+    corrected = pixels - float(background_level) if subtract_background else pixels.copy()
+    return np.clip(corrected, 0.0, None)
+
+
+def fit_gaussian_nelder_mead(
+    pixels, background_level=0.0, subtract_background=True, noise_sigma=None,
+):
+    """Оценивает x0, y0 и sigma взвешенным методом Нелдера–Мида.
+
+    pixels — исходный ROI в LSB; background_level вычитается только при флаге;
+    noise_sigma — СКО рамки для SNR и chi-square. Оптимизируются три параметра,
+    а яркостные веса и совпадение центральной амплитуды повторяют FRT_main.
+    """
+    raw_pixels = _as_valid_image(pixels, "pixels")
+    fit_signal = _prepare_fit_signal(raw_pixels, background_level, subtract_background)
+    total_signal = float(np.sum(fit_signal))
+    normalized = normalize_signal_sum1(fit_signal)
     height, width = normalized.shape
     weights = normalized.copy()
 
@@ -256,12 +325,19 @@ def fit_gaussian_weighted(pixels):
         y0 = (height - 1.0) / 2.0
         zeros = np.zeros_like(normalized)
         return {
+            "method": FIT_METHOD_NELDER_MEAD,
             "x0": x0, "y0": y0, "sigma": 1.0, "A": 0.0,
             "success": False, "loss": 0.0, "model": zeros,
-            "model_signal": zeros, "abs_errors": zeros, "weights": weights,
+            "model_signal": zeros, "fit_signal": fit_signal,
+            "abs_errors": zeros, "weights": weights,
+            "background_level": float(background_level),
+            "background_subtracted": bool(subtract_background),
+            "noise_sigma": noise_sigma, "snr_peak": np.nan,
+            "chi_square": np.nan, "reduced_chi_square": np.nan,
             "message": "В ROI отсутствует положительный сигнал",
         }
 
+    # Энергетический центроид и второй момент задают стартовый симплекс.
     x_grid = np.arange(width, dtype=float)
     y_grid = np.arange(height, dtype=float)
     x0_init = float(np.sum(weights * x_grid[None, :]))
@@ -270,22 +346,27 @@ def fit_gaussian_weighted(pixels):
         weights * ((x_grid[None, :] - x0_init) ** 2 + (y_grid[:, None] - y0_init) ** 2)
     ) / 2.0
     sigma_init = float(np.sqrt(max(radial_variance - 1.0 / 12.0, 0.05**2)))
-    sqrt_weights = np.sqrt(weights)
 
-    def residuals(params):
-        """Возвращает вектор взвешенных невязок для least_squares.
+    def loss(params):
+        """Возвращает яркостно-взвешенную сумму квадратов.
 
-        params=(local_x0,local_y0,sigma); данные и веса взяты из внешнего ROI.
+        params=(local_x0,local_y0,sigma); нефизические точки получают штраф.
         """
         local_x0, local_y0, fitted_sigma = params
+        if (
+            fitted_sigma < 0.05 or fitted_sigma > 2.0 * max(height, width)
+            or local_x0 < -0.5 or local_x0 > width - 0.5
+            or local_y0 < -0.5 or local_y0 > height - 0.5
+        ):
+            return 1e6
         model = model_image((height, width), local_x0, local_y0, fitted_sigma)
-        return (sqrt_weights * (normalized - model)).ravel()
+        return float(np.sum(weights * (normalized - model) ** 2))
 
-    result = least_squares(
-        residuals,
+    result = minimize(
+        loss,
         [x0_init, y0_init, sigma_init],
-        bounds=([-0.5, -0.5, 0.05], [width - 0.5, height - 0.5, 2.0 * max(height, width)]),
-        method="trf",
+        method="Nelder-Mead",
+        options={"xatol": 1e-9, "fatol": 1e-14, "maxiter": 5000},
     )
     x0, y0, sigma = result.x
     model = model_image((height, width), x0, y0, sigma)
@@ -294,14 +375,58 @@ def fit_gaussian_weighted(pixels):
     amplitude = normalized[center_y, center_x] / central_gauss if central_gauss > 0 else 0.0
     fitted_model = amplitude * model
     model_signal = total_signal * fitted_model
+
+    # СКО рамки не меняет минимум при однородном гауссовом шуме, но задаёт
+    # физический масштаб SNR и chi-square для сравнения качества методов.
+    valid_noise = noise_sigma is not None and np.isfinite(noise_sigma) and noise_sigma > 0
+    signal_peak_above_background = max(float(np.max(raw_pixels)) - float(background_level), 0.0)
+    snr_peak = signal_peak_above_background / noise_sigma if valid_noise else np.nan
+    chi_square = (
+        float(np.sum(((fit_signal - model_signal) / noise_sigma) ** 2))
+        if valid_noise else np.nan
+    )
+    degrees_of_freedom = max(fit_signal.size - 3, 1)
+    reduced_chi_square = chi_square / degrees_of_freedom if valid_noise else np.nan
     return {
+        "method": FIT_METHOD_NELDER_MEAD,
         "x0": float(x0), "y0": float(y0), "sigma": float(sigma),
         "A": float(amplitude), "success": bool(result.success),
-        "loss": float(np.sum(result.fun**2)), "model": fitted_model,
-        "model_signal": model_signal,
-        "abs_errors": np.abs(positive_signal - model_signal),
-        "weights": weights, "message": result.message,
+        "loss": float(result.fun), "model": fitted_model,
+        "model_signal": model_signal, "fit_signal": fit_signal,
+        "abs_errors": np.abs(fit_signal - model_signal),
+        "weights": weights, "background_level": float(background_level),
+        "background_subtracted": bool(subtract_background),
+        "noise_sigma": float(noise_sigma) if valid_noise else None,
+        "snr_peak": float(snr_peak), "chi_square": chi_square,
+        "reduced_chi_square": reduced_chi_square,
+        "message": result.message,
     }
+
+
+def fit_gaussian(
+    pixels, method=FIT_METHOD_NELDER_MEAD, background_level=0.0,
+    subtract_background=True, noise_sigma=None,
+):
+    """Направляет ROI в выбранный алгоритм оценки ФРТ.
+
+    method — строковый идентификатор выпадающего списка; остальные переменные
+    передаются методу. Пока зарегистрирован только FIT_METHOD_NELDER_MEAD, а
+    новые алгоритмы добавляются сюда без изменения интерфейсной цепочки.
+    """
+    if method == FIT_METHOD_NELDER_MEAD:
+        return fit_gaussian_nelder_mead(
+            pixels, background_level, subtract_background, noise_sigma
+        )
+    raise ValueError(f"Неизвестный метод оценки: {method}")
+
+
+def fit_gaussian_weighted(pixels):
+    """Сохраняет совместимость старого вызова взвешенного fit.
+
+    pixels считается уже подготовленным сигналом без фона; фактический расчёт
+    выполняет восстановленный метод Нелдера–Мида.
+    """
+    return fit_gaussian_nelder_mead(pixels, 0.0, False, None)
 
 
 def local_to_global(local_x, local_y, origin_x, origin_y):

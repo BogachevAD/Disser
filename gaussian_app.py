@@ -32,9 +32,11 @@ from PyQt6.QtWidgets import (
 )
 
 from gaussian_math import (
+    FIT_METHOD_NELDER_MEAD,
     ROI_MODE_MATCHED_FILTER,
     ROI_MODE_TRUTH,
-    fit_gaussian_weighted,
+    estimate_background_ring,
+    fit_gaussian,
     local_to_global,
     lsb_to_watts,
     model_image,
@@ -129,6 +131,9 @@ class GaussianSimulatorWindow(QMainWindow):
         ("По заданному центру — верификация", ROI_MODE_TRUTH),
         ("Согласованный фильтр — обнаружение", ROI_MODE_MATCHED_FILTER),
     ]
+    FIT_METHODS = [
+        ("Нелдер–Мид — взвешенный МНК", FIT_METHOD_NELDER_MEAD),
+    ]
 
     def __init__(self, config):
         """Создаёт состояние модели, интерфейс и первый кадр.
@@ -142,6 +147,7 @@ class GaussianSimulatorWindow(QMainWindow):
         self.last_roi = None
         self.last_roi_without_background = None
         self.last_selection = None
+        self.last_background_stats = None
         self.last_fit = None
         self.last_global_fit = None
         self.calculation_index = 0
@@ -235,11 +241,11 @@ class GaussianSimulatorWindow(QMainWindow):
         layout.addWidget(self.generate_geom_button, 3, 0, 1, 2)
 
     def _add_roi_controls(self, parent_layout):
-        """Добавляет режим ROI и размер окна оценки.
+        """Добавляет режим ROI, метод fit и обработку фоновой рамки.
 
         parent_layout — верхняя строка, принимающая новую группу виджетов.
         """
-        group = QGroupBox("ROI и обнаружение")
+        group = QGroupBox("ROI, фон и оценивание")
         layout = QGridLayout(group)
         parent_layout.addWidget(group)
         layout.addWidget(QLabel("Центр окна"), 0, 0)
@@ -258,6 +264,49 @@ class GaussianSimulatorWindow(QMainWindow):
         self.roi_size_combo.setCurrentIndex(max(0, self.roi_size_combo.findData(configured_size)))
         self.roi_size_combo.currentIndexChanged.connect(self._on_value_changed)
         layout.addWidget(self.roi_size_combo, 1, 1)
+
+        layout.addWidget(QLabel("Метод fit"), 2, 0)
+        self.fit_method_combo = QComboBox()
+        for label, value in self.FIT_METHODS:
+            self.fit_method_combo.addItem(label, value)
+        configured_method = self.config.get("FIT_METHOD", FIT_METHOD_NELDER_MEAD)
+        self.fit_method_combo.setCurrentIndex(max(0, self.fit_method_combo.findData(configured_method)))
+        self.fit_method_combo.currentIndexChanged.connect(self._on_value_changed)
+        layout.addWidget(self.fit_method_combo, 2, 1)
+
+        layout.addWidget(QLabel("Толщина рамки"), 3, 0)
+        self.ring_width_combo = QComboBox()
+        for width in (1, 2, 3, 4):
+            self.ring_width_combo.addItem(f"{width} px", width)
+        configured_width = self.config.get("BACKGROUND_RING_WIDTH", 1)
+        self.ring_width_combo.setCurrentIndex(max(0, self.ring_width_combo.findData(configured_width)))
+        self.ring_width_combo.currentIndexChanged.connect(self._on_value_changed)
+        layout.addWidget(self.ring_width_combo, 3, 1)
+
+        layout.addWidget(QLabel("Отступ до рамки"), 4, 0)
+        self.ring_gap_combo = QComboBox()
+        for gap in (0, 1, 2, 3, 4):
+            self.ring_gap_combo.addItem(f"{gap} px", gap)
+        configured_gap = self.config.get("BACKGROUND_RING_GAP", 3)
+        self.ring_gap_combo.setCurrentIndex(max(0, self.ring_gap_combo.findData(configured_gap)))
+        self.ring_gap_combo.currentIndexChanged.connect(self._on_value_changed)
+        layout.addWidget(self.ring_gap_combo, 4, 1)
+
+        self.subtract_background_checkbox = QCheckBox("Вычитать средний фон по рамке")
+        self.subtract_background_checkbox.setChecked(self.config.get("SUBTRACT_RING_BACKGROUND", True))
+        self.subtract_background_checkbox.setToolTip(
+            "Вычитается среднее значение рамки; случайная реализация шума в ROI при этом остаётся."
+        )
+        self.subtract_background_checkbox.stateChanged.connect(self._on_value_changed)
+        layout.addWidget(self.subtract_background_checkbox, 5, 0, 1, 2)
+
+        self.use_noise_checkbox = QCheckBox("Учитывать СКО рамки в SNR и χ²")
+        self.use_noise_checkbox.setChecked(self.config.get("USE_RING_NOISE", True))
+        self.use_noise_checkbox.setToolTip(
+            "Одно и то же СКО для всех пикселей не меняет минимум, но задаёт физический масштаб SNR и χ²."
+        )
+        self.use_noise_checkbox.stateChanged.connect(self._on_value_changed)
+        layout.addWidget(self.use_noise_checkbox, 6, 0, 1, 2)
 
     def _make_matrix_box(self, title):
         """Создаёт read-only поле численной матрицы.
@@ -316,6 +365,11 @@ class GaussianSimulatorWindow(QMainWindow):
             "lsb_per_picowatt": max(float(self.inputs["lsb_per_picowatt"].value()), 1e-12),
             "roi_mode": self.roi_mode_combo.currentData(),
             "roi_size": int(self.roi_size_combo.currentData()),
+            "fit_method": self.fit_method_combo.currentData(),
+            "ring_width": int(self.ring_width_combo.currentData()),
+            "ring_gap": int(self.ring_gap_combo.currentData()),
+            "subtract_background": self.subtract_background_checkbox.isChecked(),
+            "use_ring_noise": self.use_noise_checkbox.isChecked(),
         }
 
     def update_model(self):
@@ -337,10 +391,18 @@ class GaussianSimulatorWindow(QMainWindow):
             params["sigma"], params["background_lsb"],
         )
         self.last_roi = self.last_selection.roi
-        self.last_roi_without_background = np.clip(
-            self.last_roi - params["background_lsb"], 0.0, None
+        self.last_background_stats = estimate_background_ring(
+            self.last_frame, self.last_selection.center_x, self.last_selection.center_y,
+            params["roi_size"], params["ring_width"], params["ring_gap"],
         )
-        self.last_fit = fit_gaussian_weighted(self.last_roi_without_background)
+        self.last_fit = fit_gaussian(
+            self.last_roi,
+            method=params["fit_method"],
+            background_level=self.last_background_stats.mean,
+            subtract_background=params["subtract_background"],
+            noise_sigma=self.last_background_stats.std if params["use_ring_noise"] else None,
+        )
+        self.last_roi_without_background = self.last_fit["fit_signal"]
         self.last_global_fit = local_to_global(
             self.last_fit["x0"], self.last_fit["y0"],
             self.last_selection.origin_x, self.last_selection.origin_y,
@@ -362,7 +424,26 @@ class GaussianSimulatorWindow(QMainWindow):
             self.last_selection.center_x, self.last_selection.center_y,
             marker="s", markerfacecolor="none", markeredgecolor="yellow", markersize=9,
         )
-        self.frame_axis.set_title("1. Кадр: + задано, □ центр ROI")
+        roi_half = params["roi_size"] // 2
+        ring_inner = roi_half + params["ring_gap"]
+        ring_outer = ring_inner + params["ring_width"]
+        self.frame_axis.add_patch(
+            patches.Rectangle(
+                (self.last_selection.origin_x - 0.5, self.last_selection.origin_y - 0.5),
+                params["roi_size"], params["roi_size"], edgecolor="yellow",
+                facecolor="none", linewidth=1.0,
+            )
+        )
+        for radius, linestyle in ((ring_inner, ":"), (ring_outer, "-")):
+            self.frame_axis.add_patch(
+                patches.Rectangle(
+                    (self.last_selection.center_x - radius - 0.5,
+                     self.last_selection.center_y - radius - 0.5),
+                    2 * radius + 1, 2 * radius + 1, edgecolor="magenta",
+                    facecolor="none", linewidth=0.8, linestyle=linestyle,
+                )
+            )
+        self.frame_axis.set_title("1. Кадр: + задано, жёлтый ROI, пурпурная рамка")
 
         # ROI и модель используют одну шкалу LSB, поэтому их яркости сравнимы напрямую.
         signal_min = float(np.min(self.last_roi_without_background))
@@ -371,7 +452,7 @@ class GaussianSimulatorWindow(QMainWindow):
             signal_max = signal_min + 1.0
         self.roi_axis.imshow(self.last_roi_without_background, cmap="gray", vmin=signal_min, vmax=signal_max)
         self.roi_axis.set_title(
-            f"2. ROI {params['roi_size']}×{params['roi_size']}, начало "
+            f"2. Вход fit {params['roi_size']}×{params['roi_size']}, начало "
             f"({self.last_selection.origin_x}, {self.last_selection.origin_y})"
         )
         self.fit_axis.imshow(self.last_roi_without_background, cmap="gray", vmin=signal_min, vmax=signal_max)
@@ -428,8 +509,9 @@ class GaussianSimulatorWindow(QMainWindow):
         delta_x, delta_y = global_x - params["x0"], global_y - params["y0"]
         center_error = float(np.hypot(delta_x, delta_y))
         mode_name = self.roi_mode_combo.currentText()
+        method_name = self.fit_method_combo.currentText()
         self.position_label.setText(
-            f"Расчёт №{self.calculation_index}; режим: {mode_name}; "
+            f"Расчёт №{self.calculation_index}; ROI: {mode_name}; метод: {method_name}; "
             f"задано ({params['x0']:.3f}, {params['y0']:.3f}); "
             f"сырой max=({raw_x}, {raw_y}); центр ROI=({self.last_selection.center_x}, "
             f"{self.last_selection.center_y}); локальная оценка=({self.last_fit['x0']:.3f}, "
@@ -449,7 +531,13 @@ class GaussianSimulatorWindow(QMainWindow):
             f"фон={params['background_lsb']:.3f} LSB ({background_watts:.3e} Вт); "
             f"временной σ={params['temporal_noise_lsb']:.3f} LSB ({temporal_watts:.3e} Вт); "
             f"геометрический σ={params['geometric_noise_lsb']:.3f} LSB ({geometric_watts:.3e} Вт); "
-            f"задано σ={params['sigma']:.3f}, оценено σ={self.last_fit['sigma']:.3f} px."
+            f"рамка: mean={self.last_background_stats.mean:.3f}, median="
+            f"{self.last_background_stats.median:.3f}, σ={self.last_background_stats.std:.3f} LSB, "
+            f"N={self.last_background_stats.pixel_count}, отступ={params['ring_gap']} px; фон "
+            f"{'вычтен' if params['subtract_background'] else 'не вычтен'}; "
+            f"SNRpeak={self.last_fit['snr_peak']:.3f}, χ²red="
+            f"{self.last_fit['reduced_chi_square']:.3f}; задано σ={params['sigma']:.3f}, "
+            f"оценено σ={self.last_fit['sigma']:.3f} px."
         )
 
     def _format_matrix(self, matrix):

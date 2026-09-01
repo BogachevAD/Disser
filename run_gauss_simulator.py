@@ -46,6 +46,17 @@ LSB_PER_PICOWATT = 60.0
 ROI_MODE = "truth"
 ROI_SIZE = 3
 
+# === Метод оценки и статистика фона ===
+# FIT_METHOD выбирает алгоритм из выпадающего списка; пока зарегистрирован
+# Нелдер–Мид. BACKGROUND_RING_GAP отделяет хвосты ФРТ от фоновой рамки,
+# BACKGROUND_RING_WIDTH задаёт её толщину. Средний фон можно вычитать, а его
+# СКО — использовать для SNR и chi-square.
+FIT_METHOD = "nelder_mead"
+BACKGROUND_RING_WIDTH = 1
+BACKGROUND_RING_GAP = 3
+SUBTRACT_RING_BACKGROUND = True
+USE_RING_NOISE = True
+
 CONFIG = {
     "WIDTH": WIDTH,
     "HEIGHT": HEIGHT,
@@ -62,6 +73,11 @@ CONFIG = {
     "LSB_PER_PICOWATT": LSB_PER_PICOWATT,
     "ROI_MODE": ROI_MODE,
     "ROI_SIZE": ROI_SIZE,
+    "FIT_METHOD": FIT_METHOD,
+    "BACKGROUND_RING_WIDTH": BACKGROUND_RING_WIDTH,
+    "BACKGROUND_RING_GAP": BACKGROUND_RING_GAP,
+    "SUBTRACT_RING_BACKGROUND": SUBTRACT_RING_BACKGROUND,
+    "USE_RING_NOISE": USE_RING_NOISE,
 }
 
 

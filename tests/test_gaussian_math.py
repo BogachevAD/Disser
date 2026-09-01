@@ -10,10 +10,13 @@ import numpy as np
 
 from gaussian_app import GaussianFrameSimulator
 from gaussian_math import (
+    FIT_METHOD_NELDER_MEAD,
     crop_around_detected_target,
     crop_around_max,
     crop_around_pixel,
     crop_around_position,
+    estimate_background_ring,
+    fit_gaussian,
     fit_gaussian_weighted,
     gaussian_pixel_integral,
     local_to_global,
@@ -134,6 +137,49 @@ class GaussianMathTests(unittest.TestCase):
             fit = fit_gaussian_weighted(roi)
             estimates.append(local_to_global(fit["x0"], fit["y0"], origin_x, origin_y))
         np.testing.assert_allclose(estimates, [(20.5, 16.0), (20.5, 16.0)], atol=2e-5)
+
+    def test_background_ring_excludes_roi_and_guard_gap(self):
+        """Проверяет геометрию фоновой рамки.
+
+        Сигнал в ROI и защитном отступе не должен влиять на uniform background.
+        """
+        image = np.full((15, 15), 1_000.0)
+        image[4:11, 4:11] = 50_000.0
+        statistics = estimate_background_ring(image, 7, 7, roi_size=3, ring_width=1, ring_gap=2)
+        self.assertEqual(statistics.pixel_count, 32)
+        self.assertEqual(statistics.mean, 1_000.0)
+        self.assertEqual(statistics.std, 0.0)
+
+    def test_nelder_mead_background_checkbox_changes_preprocessing(self):
+        """Проверяет Нелдер–Мид с вычитанием фона и без него.
+
+        Известный фон должен дать точную sigma; невычтенный фон ожидаемо смещает её.
+        """
+        signal = 5_000.0 * model_image((3, 3), 1.2, 0.8, 0.8)
+        roi = 1_000.0 + signal
+        corrected = fit_gaussian(
+            roi, FIT_METHOD_NELDER_MEAD, background_level=1_000.0,
+            subtract_background=True, noise_sigma=20.0,
+        )
+        raw = fit_gaussian(
+            roi, FIT_METHOD_NELDER_MEAD, background_level=1_000.0,
+            subtract_background=False, noise_sigma=20.0,
+        )
+        without_noise_scale = fit_gaussian(
+            roi, FIT_METHOD_NELDER_MEAD, background_level=1_000.0,
+            subtract_background=True, noise_sigma=None,
+        )
+        self.assertEqual(corrected["method"], FIT_METHOD_NELDER_MEAD)
+        np.testing.assert_allclose(
+            [corrected["x0"], corrected["y0"], corrected["sigma"]],
+            [1.2, 0.8, 0.8], atol=2e-5,
+        )
+        self.assertGreater(abs(raw["sigma"] - 0.8), 0.1)
+        np.testing.assert_allclose(
+            [without_noise_scale["x0"], without_noise_scale["y0"], without_noise_scale["sigma"]],
+            [corrected["x0"], corrected["y0"], corrected["sigma"]], atol=1e-10,
+        )
+        self.assertTrue(np.isnan(without_noise_scale["reduced_chi_square"]))
 
 
 if __name__ == "__main__":
