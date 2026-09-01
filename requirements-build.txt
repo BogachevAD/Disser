@@ -1,0 +1,2 @@
+# PyInstaller включает интерпретатор Python и зависимости в автономный EXE.
+pyinstaller>=6.18,<7

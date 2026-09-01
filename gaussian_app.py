@@ -8,10 +8,7 @@
 
 from dataclasses import dataclass, field
 
-import matplotlib.patches as patches
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
@@ -30,6 +27,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# PyQt6 импортируется раньше QtAgg: так Matplotlib однозначно выбирает уже
+# загруженный Qt-биндинг и в обычном Python, и внутри пакета PyInstaller.
+import matplotlib.patches as patches
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,

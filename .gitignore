@@ -6,3 +6,8 @@ __pycache__/
 .idea/
 .venv/
 venv/
+# Локальное окружение и результаты PyInstaller могут занимать сотни мегабайт.
+.build_venv/
+build/
+dist/
+*.spec

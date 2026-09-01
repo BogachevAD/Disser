@@ -35,12 +35,66 @@ Disser/
 ├── gaussian_math.py          математическое ядро, ROI, обнаружение и fit
 ├── gaussian_app.py           генератор кадра и графический интерфейс PyQt6
 ├── run_gauss_simulator.py    начальные параметры и точка запуска GUI
+├── build_exe.py              воспроизводимая сборка автономного Windows EXE
+├── build_exe.bat             запуск сборки двойным щелчком
 ├── FRT_main.py               анализ экспериментальной TXT-матрицы
 ├── __init__.py               публичные импорты пакета
 ├── requirements.txt          зависимости Python
+├── requirements-build.txt    PyInstaller для автономной сборки
 └── tests/
-    └── test_gaussian_math.py регрессионные тесты
+    ├── test_gaussian_math.py регрессионные тесты модели
+    └── test_build_exe.py     тесты конфигурации сборщика
 ```
+
+## Сборка автономного Windows EXE
+
+Самый простой способ — дважды щёлкнуть `build_exe.bat`. Сценарий автоматически:
+
+1. находит установленный Python;
+2. создаёт изолированное окружение `.build_venv`;
+3. устанавливает `requirements.txt` и `requirements-build.txt`;
+4. запускает PyInstaller в режимах `--onefile` и `--windowed`;
+5. проверяет файл и печатает его размер и SHA-256.
+
+Готовое приложение появляется здесь:
+
+```text
+dist/IK_Gaussian_Simulator.exe
+```
+
+На компьютере, где запускается готовый EXE, Python, PyQt6, NumPy, SciPy и
+Matplotlib устанавливать не нужно. Первый запуск one-file приложения может быть
+медленнее последующих: PyInstaller распаковывает встроенные компоненты во
+временный каталог.
+
+Запуск сборки из терминала:
+
+```powershell
+python build_exe.py
+```
+
+Полезные параметры:
+
+```powershell
+# Полностью пересоздать сборочное окружение
+python build_exe.py --recreate-env
+
+# Не проверять зависимости повторно
+python build_exe.py --skip-install
+
+# Собрать папку для диагностики вместо единственного файла
+python build_exe.py --onedir
+```
+
+Если создать `assets/app.ico`, сценарий автоматически применит эту иконку.
+
+Ограничения переносимости:
+
+- PyInstaller не является кросс-компилятором: Windows EXE собирается в Windows;
+- текущая сборка предназначена для совместимой 64-разрядной Windows 10/11;
+- для Linux или macOS приложение нужно собирать отдельно на соответствующей ОС;
+- EXE пока не подписан сертификатом, поэтому Windows SmartScreen может показать
+  предупреждение для впервые загруженного файла.
 
 ## Система координат
 
@@ -361,6 +415,20 @@ y_{global}=y_{origin}+y_{local}.
 Файл содержит только стартовые константы и словарь `CONFIG`. Блок
 `if __name__ == "__main__"` запускает GUI при прямом выполнении, но не при
 импорте файла тестами.
+
+### `build_exe.py` и `build_exe.bat`
+
+- `build_exe.bat` выбирает `py` или `python` и запускает сборку двойным щелчком;
+- `run_command(...)` безопасно выполняет команду без shell-интерпретации;
+- `isolated_build_environment(...)` очищает PATH от посторонних DLL;
+- `build_environment_python(...)` создаёт изолированную `.build_venv`;
+- `install_dependencies(...)` устанавливает runtime- и build-зависимости;
+- `pyinstaller_command(...)` формирует параметры onefile/windowed;
+- `executable_path(...)` вычисляет ожидаемый путь результата;
+- `sha256_file(...)` рассчитывает контрольную сумму готового файла;
+- `build_executable(...)` выполняет полную цепочку и проверяет наличие EXE;
+- `build_argument_parser()` описывает дополнительные CLI-флаги;
+- `main(argv)` проверяет Windows и выводит итог сборки.
 
 ### `FRT_main.py`
 
