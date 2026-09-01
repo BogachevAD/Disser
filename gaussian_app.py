@@ -38,8 +38,13 @@ class GaussianFrameSimulator:
         self.geometric_noise = None
 
     def generate_geometric_noise(self, shape, geometric_noise_lsb):
-        """Создает новую карту геометрического шума для текущего размера кадра."""
-        self.geometric_noise = self.rng.normal(0.0, geometric_noise_lsb, shape)
+        """Создает новую единичную карту геометрического шума.
+
+        В поле хранится реализация N(0, 1), а текущая sigma применяется при
+        моделировании. Поэтому изменение sigma сохраняет рисунок неоднородности,
+        но корректно меняет его величину.
+        """
+        self.geometric_noise = self.rng.standard_normal(shape)
 
     def simulate(self, width, height, x0, y0, sigma, amplitude_lsb, background_lsb,
                  temporal_noise_lsb, geometric_noise_lsb, fix_geometric_noise, adc_bits):
@@ -58,7 +63,7 @@ class GaussianFrameSimulator:
         if fix_geometric_noise:
             if self.geometric_noise is None or self.geometric_noise.shape != shape:
                 self.generate_geometric_noise(shape, geometric_noise_lsb)
-            geometric = self.geometric_noise
+            geometric = geometric_noise_lsb * self.geometric_noise
         else:
             geometric = self.rng.normal(0.0, geometric_noise_lsb, shape)
             self.geometric_noise = None

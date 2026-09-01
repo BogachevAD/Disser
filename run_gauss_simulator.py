@@ -1,7 +1,7 @@
 """Файл запуска PyCharm: здесь собраны основные константы модели.
 
 Запуск:
-    python run_gaussian_simulator.py
+    python run_gauss_simulator.py
 """
 
 from gaussian_app import run_gaussian_simulator

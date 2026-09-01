@@ -1,17 +1,21 @@
 """Математические функции для моделирования и оценки гауссова пятна."""
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.special import erf
+from scipy.optimize import least_squares
+from scipy.special import ndtr
 
 
 def lsb_to_watts(value_lsb, lsb_per_picowatt):
     """Переводит разряды АЦП в Ватты."""
+    if lsb_per_picowatt <= 0:
+        raise ValueError("lsb_per_picowatt должен быть положительным")
     return np.asarray(value_lsb, dtype=float) / lsb_per_picowatt * 1e-12
 
 
 def watts_to_lsb(value_watts, lsb_per_picowatt):
     """Переводит Ватты в разряды АЦП."""
+    if lsb_per_picowatt <= 0:
+        raise ValueError("lsb_per_picowatt должен быть положительным")
     return np.asarray(value_watts, dtype=float) / 1e-12 * lsb_per_picowatt
 
 
@@ -46,8 +50,11 @@ def normalize_signal_sum1(pixels):
 def gaussian_pixel_integral(x0, y0, sigma, i, j):
     """Интеграл 2D-гауссианы по площади пикселя с центром в (i, j)."""
 
+    if sigma <= 0:
+        raise ValueError("sigma должна быть положительной")
+
     def phi(t):
-        return 0.5 * (1.0 + erf(t / (np.sqrt(2.0) * sigma)))
+        return ndtr(t / sigma)
 
     x1, x2 = i - 0.5, i + 0.5
     y1, y2 = j - 0.5, j + 0.5
@@ -57,12 +64,18 @@ def gaussian_pixel_integral(x0, y0, sigma, i, j):
 def model_image(shape, x0, y0, sigma):
     """Возвращает нормированную на сумму 1 гауссову модель размера (height, width)."""
     height, width = shape
-    y_idx, x_idx = np.indices((height, width))
-    phi_x2 = 0.5 * (1.0 + erf((x_idx + 0.5 - x0) / (np.sqrt(2.0) * sigma)))
-    phi_x1 = 0.5 * (1.0 + erf((x_idx - 0.5 - x0) / (np.sqrt(2.0) * sigma)))
-    phi_y2 = 0.5 * (1.0 + erf((y_idx + 0.5 - y0) / (np.sqrt(2.0) * sigma)))
-    phi_y1 = 0.5 * (1.0 + erf((y_idx - 0.5 - y0) / (np.sqrt(2.0) * sigma)))
-    image = (phi_x2 - phi_x1) * (phi_y2 - phi_y1)
+    if height <= 0 or width <= 0:
+        raise ValueError("Размеры изображения должны быть положительными")
+    if sigma <= 0:
+        raise ValueError("sigma должна быть положительной")
+
+    # Интеграл круговой 2D-гауссианы сепарабелен. Внешнее произведение
+    # одномерных интегралов экономит четыре полноразмерных временных массива.
+    x = np.arange(width, dtype=float)
+    y = np.arange(height, dtype=float)
+    x_mass = ndtr((x + 0.5 - x0) / sigma) - ndtr((x - 0.5 - x0) / sigma)
+    y_mass = ndtr((y + 0.5 - y0) / sigma) - ndtr((y - 0.5 - y0) / sigma)
+    image = np.outer(y_mass, x_mass)
     total = np.sum(image)
     if total <= 0:
         return image
@@ -70,19 +83,60 @@ def model_image(shape, x0, y0, sigma):
 
 
 def fit_gaussian_weighted(pixels):
-    """Подгоняет x0, y0 и sigma к 2D-матрице тем же взвешенным методом."""
+    """Подгоняет x0, y0 и sigma к 2D-матрице взвешенным МНК.
+
+    Координаты центра и sigma ограничены физически допустимой областью. Это
+    предотвращает уход оптимизатора в отрицательную ширину или далеко за ROI.
+    """
     pixels = np.asarray(pixels, dtype=float)
+    if pixels.ndim != 2 or pixels.size == 0:
+        raise ValueError("pixels должна быть непустой двумерной матрицей")
+    if not np.all(np.isfinite(pixels)):
+        raise ValueError("pixels содержит NaN или бесконечные значения")
+
+    pixels = normalize_signal_sum1(pixels)
     height, width = pixels.shape
     weights = np.clip(pixels, 0.0, None)
 
-    def loss(params):
-        x0, y0, sigma = params
-        if sigma <= 0:
-            return np.inf
-        model = model_image((height, width), x0, y0, sigma)
-        return np.sum(weights * (pixels - model) ** 2)
+    if np.sum(weights) <= 0:
+        x0 = (width - 1.0) / 2.0
+        y0 = (height - 1.0) / 2.0
+        return {
+            "x0": x0,
+            "y0": y0,
+            "sigma": 1.0,
+            "A": 0.0,
+            "success": False,
+            "loss": 0.0,
+            "model": np.zeros_like(pixels),
+            "abs_errors": np.zeros_like(pixels),
+            "weights": weights,
+            "message": "В ROI отсутствует положительный сигнал",
+        }
 
-    result = minimize(loss, [width / 2.0, height / 2.0, 1.0], method="Nelder-Mead")
+    x_grid = np.arange(width, dtype=float)
+    y_grid = np.arange(height, dtype=float)
+    x0_init = float(np.sum(weights * x_grid[None, :]))
+    y0_init = float(np.sum(weights * y_grid[:, None]))
+    radial_variance = np.sum(
+        weights
+        * ((x_grid[None, :] - x0_init) ** 2 + (y_grid[:, None] - y0_init) ** 2)
+    ) / 2.0
+    # Дисперсия интегрированного по площади пикселя сигнала включает 1/12 px².
+    sigma_init = float(np.sqrt(max(radial_variance - 1.0 / 12.0, 0.05**2)))
+    sqrt_weights = np.sqrt(weights)
+
+    def residuals(params):
+        x0, y0, sigma = params
+        model = model_image((height, width), x0, y0, sigma)
+        return (sqrt_weights * (pixels - model)).ravel()
+
+    result = least_squares(
+        residuals,
+        [x0_init, y0_init, sigma_init],
+        bounds=([-0.5, -0.5, 0.05], [width - 0.5, height - 0.5, 2.0 * max(height, width)]),
+        method="trf",
+    )
     x0, y0, sigma = result.x
     model = model_image((height, width), x0, y0, sigma)
     yc, xc = height // 2, width // 2
@@ -95,15 +149,21 @@ def fit_gaussian_weighted(pixels):
         "sigma": sigma,
         "A": amplitude,
         "success": result.success,
-        "loss": result.fun,
+        "loss": float(np.sum(result.fun**2)),
         "model": fitted_model,
         "abs_errors": np.abs(pixels - fitted_model),
         "weights": weights,
+        "message": result.message,
     }
 
 
 def crop_around_max(image, size=3):
     """Вырезает окно size×size вокруг максимального пикселя с дополнением краев."""
+    image = np.asarray(image)
+    if image.ndim != 2 or image.size == 0:
+        raise ValueError("image должна быть непустой двумерной матрицей")
+    if not isinstance(size, (int, np.integer)) or size <= 0 or size % 2 == 0:
+        raise ValueError("size должен быть положительным нечетным целым числом")
     half = size // 2
     y_max, x_max = np.unravel_index(np.argmax(image), image.shape)
     padded = np.pad(image, half, mode="edge")
