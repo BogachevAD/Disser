@@ -8,6 +8,7 @@
 from gaussian_app import GaussianFrameSimulator, GaussianSimulatorApp, run_gaussian_simulator
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
+    FIT_METHOD_QUADRANT_NELDER_MEAD,
     ROI_MODE_MATCHED_FILTER,
     ROI_MODE_TRUTH,
     BackgroundStatistics,
@@ -17,6 +18,7 @@ from gaussian_math import (
     estimate_background_ring,
     fit_gaussian,
     fit_gaussian_nelder_mead,
+    fit_gaussian_quadrant_nelder_mead,
     fit_gaussian_weighted,
     local_to_global,
     lsb_to_watts,
@@ -24,6 +26,7 @@ from gaussian_math import (
     model_image,
     normalize_pixels_sum1,
     normalize_signal_sum1,
+    quadrant_preprocess,
     select_roi,
     watts_to_lsb,
 )
@@ -34,6 +37,7 @@ __all__ = [
     "GaussianSimulatorApp",
     "BackgroundStatistics",
     "FIT_METHOD_NELDER_MEAD",
+    "FIT_METHOD_QUADRANT_NELDER_MEAD",
     "ROI_MODE_MATCHED_FILTER",
     "ROI_MODE_TRUTH",
     "RoiSelection",
@@ -42,6 +46,7 @@ __all__ = [
     "estimate_background_ring",
     "fit_gaussian",
     "fit_gaussian_nelder_mead",
+    "fit_gaussian_quadrant_nelder_mead",
     "fit_gaussian_weighted",
     "local_to_global",
     "lsb_to_watts",
@@ -49,6 +54,7 @@ __all__ = [
     "model_image",
     "normalize_pixels_sum1",
     "normalize_signal_sum1",
+    "quadrant_preprocess",
     "run_gaussian_simulator",
     "select_roi",
     "watts_to_lsb",

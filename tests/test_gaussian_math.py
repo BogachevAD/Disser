@@ -11,6 +11,7 @@ import numpy as np
 from gaussian_app import GaussianFrameSimulator
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
+    FIT_METHOD_QUADRANT_NELDER_MEAD,
     crop_around_detected_target,
     crop_around_max,
     crop_around_pixel,
@@ -22,6 +23,7 @@ from gaussian_math import (
     local_to_global,
     lsb_to_watts,
     model_image,
+    quadrant_preprocess,
     watts_to_lsb,
 )
 
@@ -59,6 +61,70 @@ class GaussianMathTests(unittest.TestCase):
                 self.assertTrue(result["success"])
                 np.testing.assert_allclose(
                     [result["x0"], result["y0"], result["sigma"]], expected, rtol=0, atol=2e-5
+                )
+
+    def test_quadrant_preprocessor_selects_expected_corner(self):
+        """Проверяет суммы квадрантов для пятна справа сверху.
+
+        Идеальная ФРТ с центром (1.7,0.3) должна выбрать RT, дать правильные
+        знаки Δ/Σ и указать дискретный пиксель (2,0).
+        """
+        signal = model_image((3, 3), 1.7, 0.3, 0.8)
+        quadrant = quadrant_preprocess(signal)
+        self.assertEqual(quadrant["selected_quadrants"], ["RT"])
+        self.assertGreater(quadrant["delta_x"], 0.0)
+        self.assertLess(quadrant["delta_y"], 0.0)
+        self.assertEqual((quadrant["coarse_pixel_x"], quadrant["coarse_pixel_y"]), (2, 0))
+
+    def test_quadrant_tie_does_not_bias_centered_spot(self):
+        """Исключает произвольный выбор угла для центрированного пятна.
+
+        При равенстве четырёх сумм объединяются все квадранты, поэтому стартовая
+        оценка остаётся в центре ROI, а уверенность практически равна нулю.
+        """
+        quadrant = quadrant_preprocess(model_image((3, 3), 1.0, 1.0, 0.8))
+        self.assertEqual(set(quadrant["selected_quadrants"]), {"LT", "RT", "LB", "RB"})
+        np.testing.assert_allclose([quadrant["x0_init"], quadrant["y0_init"]], [1.0, 1.0], atol=1e-14)
+        self.assertLess(quadrant["confidence"], 1e-12)
+
+    def test_quadrant_then_nelder_mead_recovers_ideal_gaussian(self):
+        """Проверяет полную цепочку квадранты → Нелдер–Мид.
+
+        Результат должен восстановить заданные x0/y0/sigma, сохранить сведения
+        о RT-квадранте и несколько реперных точек для анимации интерфейса.
+        """
+        expected = (1.7, 0.3, 0.8)
+        result = fit_gaussian(
+            model_image((3, 3), *expected), FIT_METHOD_QUADRANT_NELDER_MEAD,
+            background_level=0.0, subtract_background=False, noise_sigma=None,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["method"], FIT_METHOD_QUADRANT_NELDER_MEAD)
+        self.assertEqual(result["quadrant"]["selected_quadrants"], ["RT"])
+        self.assertGreaterEqual(len(result["optimization_trace"]), 2)
+        self.assertLessEqual(len(result["optimization_trace"]), 10)
+        np.testing.assert_allclose(
+            [result["x0"], result["y0"], result["sigma"]], expected, atol=2e-5,
+        )
+
+    def test_quadrant_fit_is_stable_in_all_four_directions(self):
+        """Проверяет комбинированный метод во всех направлениях от центра.
+
+        Четыре несимметричных положения исключают скрытую привязку реализации к
+        одному углу ROI; каждый fit должен сойтись к одной точности.
+        """
+        for expected in (
+            (0.35, 0.55, 0.75), (1.65, 0.45, 0.9),
+            (0.45, 1.7, 1.1), (1.6, 1.55, 0.65),
+        ):
+            with self.subTest(expected=expected):
+                result = fit_gaussian(
+                    model_image((3, 3), *expected), FIT_METHOD_QUADRANT_NELDER_MEAD,
+                    background_level=0.0, subtract_background=False, noise_sigma=None,
+                )
+                self.assertTrue(result["success"])
+                np.testing.assert_allclose(
+                    [result["x0"], result["y0"], result["sigma"]], expected, atol=3e-5,
                 )
 
     def test_fixed_geometric_pattern_scales_with_requested_sigma(self):

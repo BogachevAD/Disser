@@ -36,6 +36,7 @@ from matplotlib.figure import Figure
 
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
+    FIT_METHOD_QUADRANT_NELDER_MEAD,
     ROI_MODE_MATCHED_FILTER,
     ROI_MODE_TRUTH,
     estimate_background_ring,
@@ -45,6 +46,7 @@ from gaussian_math import (
     model_image,
     select_roi,
 )
+from algorithm_animation import AlgorithmAnimationDialog
 
 
 @dataclass
@@ -136,6 +138,7 @@ class GaussianSimulatorWindow(QMainWindow):
     ]
     FIT_METHODS = [
         ("Нелдер–Мид — взвешенный МНК", FIT_METHOD_NELDER_MEAD),
+        ("Квадранты → Нелдер–Мид", FIT_METHOD_QUADRANT_NELDER_MEAD),
     ]
 
     def __init__(self, config):
@@ -193,6 +196,16 @@ class GaussianSimulatorWindow(QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         root_layout.addWidget(self.canvas, stretch=1)
         self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis = self.figure.subplots(1, 4)
+
+        # Кнопка открывает воспроизводимую анимацию уже выполненного расчёта:
+        # новый шумовой кадр при этом не генерируется и результат не меняется.
+        animation_row = QHBoxLayout()
+        animation_row.addStretch(1)
+        self.animation_button = QPushButton("Показать работу алгоритма")
+        self.animation_button.clicked.connect(self._on_animation_clicked)
+        animation_row.addWidget(self.animation_button)
+        animation_row.addStretch(1)
+        root_layout.addLayout(animation_row)
 
         # Нижние моноширинные поля позволяют численно сравнить три матрицы.
         matrix_row = QHBoxLayout()
@@ -522,6 +535,15 @@ class GaussianSimulatorWindow(QMainWindow):
             f"Δ=({delta_x:+.3f}, {delta_y:+.3f}) px, |Δ|={center_error:.3f} px; "
             f"fit={'OK' if self.last_fit['success'] else 'ОШИБКА'}, loss={self.last_fit['loss']:.3e}."
         )
+        quadrant = self.last_fit.get("quadrant")
+        if quadrant is not None:
+            selected = "/".join(quadrant["selected_quadrants"])
+            self.position_label.setText(
+                self.position_label.text()
+                + f" Квадранты: {selected}; Δ/Σ=({quadrant['delta_x']:+.3f}, "
+                  f"{quadrant['delta_y']:+.3f}); старт=({quadrant['x0_init']:.3f}, "
+                  f"{quadrant['y0_init']:.3f}); уверенность={quadrant['confidence']:.3f}."
+            )
         warning = (not self.last_fit["success"]) or center_error > 0.75
         self.position_label.setStyleSheet("color: #b00020;" if warning else "color: #146c2e;")
 
@@ -577,6 +599,17 @@ class GaussianSimulatorWindow(QMainWindow):
         self.fix_geometric_checkbox.setChecked(True)
         self.fix_geometric_checkbox.blockSignals(False)
         self.update_model()
+
+    def _on_animation_clicked(self):
+        """Открывает анимацию последнего рассчитанного метода.
+
+        last_fit содержит неизменяемые вход, квадранты и трассу оптимизации;
+        модальный диалог не генерирует новый кадр и не запускает повторный fit.
+        """
+        if self.last_fit is None:
+            return
+        dialog = AlgorithmAnimationDialog(self.last_fit, self)
+        dialog.exec()
 
 
 GaussianSimulatorApp = GaussianSimulatorWindow

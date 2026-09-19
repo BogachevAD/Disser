@@ -16,6 +16,7 @@ from scipy.special import ndtr
 ROI_MODE_TRUTH = "truth"
 ROI_MODE_MATCHED_FILTER = "matched_filter"
 FIT_METHOD_NELDER_MEAD = "nelder_mead"
+FIT_METHOD_QUADRANT_NELDER_MEAD = "quadrant_nelder_mead"
 
 
 @dataclass(frozen=True)
@@ -304,14 +305,89 @@ def _prepare_fit_signal(pixels, background_level, subtract_background):
     return np.clip(corrected, 0.0, None)
 
 
-def fit_gaussian_nelder_mead(
-    pixels, background_level=0.0, subtract_background=True, noise_sigma=None,
+def quadrant_preprocess(pixels):
+    """Выполняет четырёхквадрантную грубую локализацию в нечётном ROI.
+
+    pixels — подготовленная неотрицательная матрица 3×3, 5×5 или 7×7.
+    Четыре перекрывающихся квадранта содержат центральные строку и столбец;
+    результат хранит суммы, Δ/Σ, выбранные квадранты и стартовую оценку.
+    """
+    signal = _as_valid_image(pixels, "pixels")
+    height, width = signal.shape
+    if height < 3 or width < 3 or height % 2 == 0 or width % 2 == 0:
+        raise ValueError("Квадрантный метод требует нечётный ROI не меньше 3×3")
+    normalized = normalize_signal_sum1(signal)
+    center_y, center_x = height // 2, width // 2
+    slices = {
+        "LT": (slice(0, center_y + 1), slice(0, center_x + 1)),
+        "RT": (slice(0, center_y + 1), slice(center_x, width)),
+        "LB": (slice(center_y, height), slice(0, center_x + 1)),
+        "RB": (slice(center_y, height), slice(center_x, width)),
+    }
+    sums = {name: float(np.sum(normalized[region])) for name, region in slices.items()}
+    maximum = max(sums.values(), default=0.0)
+    tolerance = max(1e-12, abs(maximum) * 1e-10)
+    winners = [name for name, value in sums.items() if maximum - value <= tolerance]
+
+    # Равные максимумы объединяются: пятно на осевой границе не получает
+    # произвольного смещения вверх/влево только из-за порядка словаря.
+    selected_mask = np.zeros_like(normalized, dtype=bool)
+    for name in winners:
+        selected_mask[slices[name]] = True
+    selected_signal = np.where(selected_mask, normalized, 0.0)
+    selected_total = float(np.sum(selected_signal))
+    if selected_total <= 0:
+        x0_init, y0_init = float(center_x), float(center_y)
+    else:
+        x_grid = np.arange(width, dtype=float)
+        y_grid = np.arange(height, dtype=float)
+        x0_init = float(np.sum(selected_signal * x_grid[None, :]) / selected_total)
+        y0_init = float(np.sum(selected_signal * y_grid[:, None]) / selected_total)
+
+    left, right = sums["LT"] + sums["LB"], sums["RT"] + sums["RB"]
+    top, bottom = sums["LT"] + sums["RT"], sums["LB"] + sums["RB"]
+    delta_x = (right - left) / (right + left) if right + left > 0 else 0.0
+    delta_y = (bottom - top) / (bottom + top) if bottom + top > 0 else 0.0
+    ordered = sorted(sums.values(), reverse=True)
+    confidence = (ordered[0] - ordered[1]) / sum(ordered) if sum(ordered) > 0 else 0.0
+    coarse_pixel_x = int(np.clip(np.floor(x0_init + 0.5), 0, width - 1))
+    coarse_pixel_y = int(np.clip(np.floor(y0_init + 0.5), 0, height - 1))
+    return {
+        "sums": sums,
+        "selected_quadrants": winners,
+        "confidence": float(confidence),
+        "delta_x": float(delta_x),
+        "delta_y": float(delta_y),
+        "x0_init": x0_init,
+        "y0_init": y0_init,
+        "coarse_pixel_x": coarse_pixel_x,
+        "coarse_pixel_y": coarse_pixel_y,
+        "center_x": center_x,
+        "center_y": center_y,
+    }
+
+
+def _sample_optimization_trace(trace, maximum_points=10):
+    """Оставляет из trace равномерные состояния для интерфейсной анимации.
+
+    trace — полный список лучших точек оптимизатора; maximum_points ограничивает
+    объём результата. Первая и последняя точки сохраняются обязательно.
+    """
+    if len(trace) <= maximum_points:
+        return trace
+    indices = np.linspace(0, len(trace) - 1, maximum_points, dtype=int)
+    return [trace[index] for index in np.unique(indices)]
+
+
+def _fit_gaussian_nelder_mead(
+    pixels, background_level, subtract_background, noise_sigma,
+    use_quadrant_preprocessing, method_identifier,
 ):
-    """Оценивает x0, y0 и sigma взвешенным методом Нелдера–Мида.
+    """Общее ядро двух вариантов взвешенного Нелдера–Мида.
 
     pixels — исходный ROI в LSB; background_level вычитается только при флаге;
-    noise_sigma — СКО рамки для SNR и chi-square. Оптимизируются три параметра,
-    а яркостные веса и совпадение центральной амплитуды повторяют FRT_main.
+    noise_sigma задаёт масштаб SNR/χ²; use_quadrant_preprocessing выбирает
+    центроидный или квадрантный старт; method_identifier записывается в результат.
     """
     raw_pixels = _as_valid_image(pixels, "pixels")
     fit_signal = _prepare_fit_signal(raw_pixels, background_level, subtract_background)
@@ -325,7 +401,7 @@ def fit_gaussian_nelder_mead(
         y0 = (height - 1.0) / 2.0
         zeros = np.zeros_like(normalized)
         return {
-            "method": FIT_METHOD_NELDER_MEAD,
+            "method": method_identifier,
             "x0": x0, "y0": y0, "sigma": 1.0, "A": 0.0,
             "success": False, "loss": 0.0, "model": zeros,
             "model_signal": zeros, "fit_signal": fit_signal,
@@ -334,14 +410,21 @@ def fit_gaussian_nelder_mead(
             "background_subtracted": bool(subtract_background),
             "noise_sigma": noise_sigma, "snr_peak": np.nan,
             "chi_square": np.nan, "reduced_chi_square": np.nan,
+            "quadrant": None, "optimization_trace": [],
             "message": "В ROI отсутствует положительный сигнал",
         }
 
-    # Энергетический центроид и второй момент задают стартовый симплекс.
+    # Обычный режим стартует из центроида всего ROI; комбинированный — из
+    # энергетического центра выбранного квадрантами подмножества пикселей.
     x_grid = np.arange(width, dtype=float)
     y_grid = np.arange(height, dtype=float)
-    x0_init = float(np.sum(weights * x_grid[None, :]))
-    y0_init = float(np.sum(weights * y_grid[:, None]))
+    quadrant = quadrant_preprocess(fit_signal) if use_quadrant_preprocessing else None
+    if quadrant is None:
+        x0_init = float(np.sum(weights * x_grid[None, :]))
+        y0_init = float(np.sum(weights * y_grid[:, None]))
+    else:
+        x0_init = quadrant["x0_init"]
+        y0_init = quadrant["y0_init"]
     radial_variance = np.sum(
         weights * ((x_grid[None, :] - x0_init) ** 2 + (y_grid[:, None] - y0_init) ** 2)
     ) / 2.0
@@ -362,13 +445,42 @@ def fit_gaussian_nelder_mead(
         model = model_image((height, width), local_x0, local_y0, fitted_sigma)
         return float(np.sum(weights * (normalized - model) ** 2))
 
+    full_trace = [{
+        "iteration": 0, "x0": x0_init, "y0": y0_init,
+        "sigma": sigma_init, "loss": loss((x0_init, y0_init, sigma_init)),
+    }]
+
+    def record_iteration(current_params):
+        """Сохраняет лучшую точку очередной итерации для анимации.
+
+        current_params=(x0,y0,sigma) передаётся callback-функцией SciPy; полная
+        геометрия симплекса не сохраняется, чтобы не утяжелять расчёт и интерфейс.
+        """
+        current_x, current_y, current_sigma = map(float, current_params)
+        full_trace.append({
+            "iteration": len(full_trace), "x0": current_x, "y0": current_y,
+            "sigma": current_sigma, "loss": loss(current_params),
+        })
+
     result = minimize(
         loss,
         [x0_init, y0_init, sigma_init],
         method="Nelder-Mead",
+        callback=record_iteration,
         options={"xatol": 1e-9, "fatol": 1e-14, "maxiter": 5000},
     )
     x0, y0, sigma = result.x
+    final_state = {
+        "iteration": int(getattr(result, "nit", len(full_trace))),
+        "x0": float(x0), "y0": float(y0), "sigma": float(sigma),
+        "loss": float(result.fun),
+    }
+    if not full_trace or any(
+        abs(full_trace[-1][name] - final_state[name]) > 1e-12
+        for name in ("x0", "y0", "sigma")
+    ):
+        full_trace.append(final_state)
+    optimization_trace = _sample_optimization_trace(full_trace)
     model = model_image((height, width), x0, y0, sigma)
     center_y, center_x = height // 2, width // 2
     central_gauss = model[center_y, center_x]
@@ -388,7 +500,7 @@ def fit_gaussian_nelder_mead(
     degrees_of_freedom = max(fit_signal.size - 3, 1)
     reduced_chi_square = chi_square / degrees_of_freedom if valid_noise else np.nan
     return {
-        "method": FIT_METHOD_NELDER_MEAD,
+        "method": method_identifier,
         "x0": float(x0), "y0": float(y0), "sigma": float(sigma),
         "A": float(amplitude), "success": bool(result.success),
         "loss": float(result.fun), "model": fitted_model,
@@ -399,8 +511,37 @@ def fit_gaussian_nelder_mead(
         "noise_sigma": float(noise_sigma) if valid_noise else None,
         "snr_peak": float(snr_peak), "chi_square": chi_square,
         "reduced_chi_square": reduced_chi_square,
+        "quadrant": quadrant, "optimization_trace": optimization_trace,
         "message": result.message,
     }
+
+
+def fit_gaussian_nelder_mead(
+    pixels, background_level=0.0, subtract_background=True, noise_sigma=None,
+):
+    """Оценивает ФРТ Нелдером–Мидом со стартом из центроида ROI.
+
+    pixels, background_level, subtract_background и noise_sigma описывают входной
+    сигнал и статистику рамки; результат содержит fit и сокращённую трассу поиска.
+    """
+    return _fit_gaussian_nelder_mead(
+        pixels, background_level, subtract_background, noise_sigma,
+        False, FIT_METHOD_NELDER_MEAD,
+    )
+
+
+def fit_gaussian_quadrant_nelder_mead(
+    pixels, background_level=0.0, subtract_background=True, noise_sigma=None,
+):
+    """Выполняет квадрантную инициализацию, затем свободный Нелдер–Мид.
+
+    Квадранты задают только старт x0/y0 и не ограничивают область поиска: если
+    грубая классификация ошиблась из-за шума, оптимизатор может её исправить.
+    """
+    return _fit_gaussian_nelder_mead(
+        pixels, background_level, subtract_background, noise_sigma,
+        True, FIT_METHOD_QUADRANT_NELDER_MEAD,
+    )
 
 
 def fit_gaussian(
@@ -410,11 +551,15 @@ def fit_gaussian(
     """Направляет ROI в выбранный алгоритм оценки ФРТ.
 
     method — строковый идентификатор выпадающего списка; остальные переменные
-    передаются методу. Пока зарегистрирован только FIT_METHOD_NELDER_MEAD, а
-    новые алгоритмы добавляются сюда без изменения интерфейсной цепочки.
+    передаются методу. Зарегистрированы обычный и квадрантно-инициализированный
+    Нелдер–Мид; новые алгоритмы добавляются без изменения интерфейсной цепочки.
     """
     if method == FIT_METHOD_NELDER_MEAD:
         return fit_gaussian_nelder_mead(
+            pixels, background_level, subtract_background, noise_sigma
+        )
+    if method == FIT_METHOD_QUADRANT_NELDER_MEAD:
+        return fit_gaussian_quadrant_nelder_mead(
             pixels, background_level, subtract_background, noise_sigma
         )
     raise ValueError(f"Неизвестный метод оценки: {method}")
