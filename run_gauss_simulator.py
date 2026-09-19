@@ -30,10 +30,11 @@ AMPLITUDE_LSB = 30000.0
 BACKGROUND_LSB = 0.0
 
 # === Шумы в разрядах АЦП (LSB, стандартное отклонение) ===
-# TEMPORAL_NOISE_LSB меняется между кадрами; GEOMETRIC_NOISE_LSB задаёт
-# пространственную неоднородность. FIX_GEOMETRIC_NOISE сохраняет её рисунок.
+# TEMPORAL_NOISE_LSB задаёт покадровый шум; GEOMETRIC_NOISE_LSB — пространственную
+# неоднородность. Два FIX-флага сохраняют выбранный рисунок для сравнения методов.
 TEMPORAL_NOISE_LSB = 0.0
 GEOMETRIC_NOISE_LSB = 0.0
+FIX_TEMPORAL_NOISE = False
 FIX_GEOMETRIC_NOISE = True
 
 # === Пересчет единиц ===
@@ -69,6 +70,7 @@ CONFIG = {
     "BACKGROUND_LSB": BACKGROUND_LSB,
     "TEMPORAL_NOISE_LSB": TEMPORAL_NOISE_LSB,
     "GEOMETRIC_NOISE_LSB": GEOMETRIC_NOISE_LSB,
+    "FIX_TEMPORAL_NOISE": FIX_TEMPORAL_NOISE,
     "FIX_GEOMETRIC_NOISE": FIX_GEOMETRIC_NOISE,
     "LSB_PER_PICOWATT": LSB_PER_PICOWATT,
     "ROI_MODE": ROI_MODE,

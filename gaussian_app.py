@@ -49,23 +49,107 @@ from gaussian_math import (
 from algorithm_animation import AlgorithmAnimationDialog
 
 
+@dataclass(frozen=True)
+class NoiseMapRecord:
+    """Описывает воспроизводимую карту шума без хранения большого массива.
+
+    map_id — номер в интерфейсе, seed — состояние генерации, shape — (height, width).
+    По этим данным единичная карта N(0,1) восстанавливается побитно одинаково.
+    """
+
+    map_id: int
+    seed: int
+    shape: tuple[int, int]
+
+
 @dataclass
 class GaussianFrameSimulator:
-    """Хранит генератор случайных чисел и фиксируемую карту неоднородности.
+    """Хранит генератор, текущие карты и историю реализаций шумов.
 
-    geometric_noise содержит одну реализацию N(0,1); rng формирует независимый
-    временной шум и новые карты. Реальный масштаб задаётся в LSB при simulate().
+    Карты содержат N(0,1), а их масштаб задаётся в LSB при simulate(). В истории
+    хранятся seed и размер последних 10 карт каждого типа, а не тяжёлые массивы.
     """
 
     geometric_noise: np.ndarray | None = None
     rng: np.random.Generator = field(default_factory=np.random.default_rng)
+    temporal_noise: np.ndarray | None = None
+    geometric_noise_history: list[NoiseMapRecord] = field(default_factory=list)
+    temporal_noise_history: list[NoiseMapRecord] = field(default_factory=list)
+    geometric_noise_map_id: int | None = None
+    temporal_noise_map_id: int | None = None
+    noise_map_counter: int = 0
+
+    def _generate_noise_map(self, shape, noise_kind):
+        """Создаёт и кэширует единичную карту заданного noise_kind.
+
+        shape задаёт (height,width), noise_kind равен temporal или geometric;
+        возвращается массив N(0,1), а история соответствующего типа ограничена 10.
+        """
+        if noise_kind not in {"temporal", "geometric"}:
+            raise ValueError(f"Неизвестный тип шума: {noise_kind}")
+        shape = tuple(int(value) for value in shape)
+        seed = int(self.rng.integers(0, np.iinfo(np.uint64).max, dtype=np.uint64))
+        noise_map = np.random.default_rng(seed).standard_normal(shape)
+        self.noise_map_counter += 1
+        record = NoiseMapRecord(self.noise_map_counter, seed, shape)
+        history = getattr(self, f"{noise_kind}_noise_history")
+        history.insert(0, record)
+        del history[10:]
+        setattr(self, f"{noise_kind}_noise", noise_map)
+        setattr(self, f"{noise_kind}_noise_map_id", record.map_id)
+        return noise_map
+
+    def noise_map_records(self, noise_kind, shape=None):
+        """Возвращает историю temporal/geometric, при необходимости по размеру.
+
+        noise_kind выбирает независимый кэш; shape=(height,width) скрывает карты,
+        несовместимые с текущим кадром, не удаляя их из десяти последних записей.
+        """
+        if noise_kind not in {"temporal", "geometric"}:
+            raise ValueError(f"Неизвестный тип шума: {noise_kind}")
+        records = list(getattr(self, f"{noise_kind}_noise_history"))
+        if shape is None:
+            return records
+        normalized_shape = tuple(int(value) for value in shape)
+        return [record for record in records if record.shape == normalized_shape]
+
+    def select_noise_map(self, noise_kind, map_id):
+        """Восстанавливает выбранную карту из seed и делает её текущей.
+
+        noise_kind задаёт кэш, map_id приходит из выпадающего списка. Возвращает
+        True при найденной записи и False, если карта уже вытеснена из истории.
+        """
+        for record in self.noise_map_records(noise_kind):
+            if record.map_id == map_id:
+                noise_map = np.random.default_rng(record.seed).standard_normal(record.shape)
+                setattr(self, f"{noise_kind}_noise", noise_map)
+                setattr(self, f"{noise_kind}_noise_map_id", record.map_id)
+                return True
+        return False
+
+    def clear_temporal_noise(self):
+        """Снимает текущую фиксацию временного рисунка, сохраняя его в истории.
+
+        Входных переменных нет; следующий нефиксированный расчёт создаст новую карту.
+        """
+        self.temporal_noise = None
+        self.temporal_noise_map_id = None
 
     def clear_geometric_noise(self):
-        """Удаляет сохранённый пространственный рисунок шума.
+        """Снимает текущую фиксацию пространственного рисунка шума.
 
-        Входных переменных нет; изменяется поле self.geometric_noise.
+        Входных переменных нет; кэш сохраняется для последующего выбора карты.
         """
         self.geometric_noise = None
+        self.geometric_noise_map_id = None
+
+    def generate_temporal_noise(self, shape, temporal_noise_lsb=None):
+        """Создаёт и кэширует единичную временную карту N(0,1).
+
+        shape задаёт размер; temporal_noise_lsb оставлен симметрично интерфейсу,
+        но масштаб применяется позднее, чтобы менять СКО при том же рисунке.
+        """
+        return self._generate_noise_map(shape, "temporal")
 
     def generate_geometric_noise(self, shape, geometric_noise_lsb=None):
         """Создаёт единичную карту N(0,1) размера shape=(height,width).
@@ -73,17 +157,19 @@ class GaussianFrameSimulator:
         geometric_noise_lsb сохранён в сигнатуре для совместимости, но масштаб
         применяется позднее: это позволяет менять sigma, не меняя рисунок карты.
         """
-        self.geometric_noise = self.rng.standard_normal(shape)
+        return self._generate_noise_map(shape, "geometric")
 
     def simulate(
         self, width, height, x0, y0, sigma, amplitude_lsb, background_lsb,
         temporal_noise_lsb, geometric_noise_lsb, fix_geometric_noise, adc_bits,
+        fix_temporal_noise=False,
     ):
         """Формирует один синтетический кадр фотоприёмной матрицы.
 
         width/height задают размер; x0/y0/sigma — гауссову ФРТ; amplitude_lsb и
-        background_lsb — пик и фон; два noise_lsb — СКО шумов; adc_bits задаёт
-        насыщение. Возвращается float-матрица после сложения и ограничения АЦП.
+        background_lsb — пик и фон; два noise_lsb — СКО шумов; fix_* управляют
+        повторным использованием карт; adc_bits задаёт насыщение. Возвращается
+        float-матрица после сложения и ограничения АЦП.
         """
         shape = (height, width)
 
@@ -94,15 +180,19 @@ class GaussianFrameSimulator:
             gaussian = gaussian / gaussian_peak
         clean = background_lsb + amplitude_lsb * gaussian
 
-        # Геометрический шум постоянен по кадрам при фиксации, временной — независим.
+        # Каждый шум получает новую карту либо использует зафиксированную реализацию.
         if fix_geometric_noise:
             if self.geometric_noise is None or self.geometric_noise.shape != shape:
                 self.generate_geometric_noise(shape)
             geometric = geometric_noise_lsb * self.geometric_noise
         else:
-            geometric = self.rng.normal(0.0, geometric_noise_lsb, shape)
-            self.geometric_noise = None
-        temporal = self.rng.normal(0.0, temporal_noise_lsb, shape)
+            geometric = geometric_noise_lsb * self.generate_geometric_noise(shape)
+        if fix_temporal_noise:
+            if self.temporal_noise is None or self.temporal_noise.shape != shape:
+                self.generate_temporal_noise(shape)
+            temporal = temporal_noise_lsb * self.temporal_noise
+        else:
+            temporal = temporal_noise_lsb * self.generate_temporal_noise(shape)
 
         # АЦП отсекает отрицательные значения и насыщает сигнал максимальным кодом.
         return np.clip(clean + geometric + temporal, 0.0, 2**adc_bits - 1)
@@ -244,17 +334,72 @@ class GaussianSimulatorWindow(QMainWindow):
         return group
 
     def _add_noise_controls(self, layout):
-        """Добавляет управление геометрическим шумом.
+        """Добавляет фиксацию, историю и генерацию карт обоих шумов.
 
-        layout — сетка группы «Шумы», куда помещаются флажок и кнопка.
+        layout — сетка группы «Шумы»; созданные checkbox/combo/button сохраняются
+        в self и управляют текущими картами GaussianFrameSimulator.
         """
+        self.fix_temporal_checkbox = QCheckBox("Фиксировать временной шум")
+        self.fix_temporal_checkbox.setChecked(self.config.get("FIX_TEMPORAL_NOISE", False))
+        self.fix_temporal_checkbox.stateChanged.connect(self._on_fix_temporal_changed)
+        layout.addWidget(self.fix_temporal_checkbox, 2, 0, 1, 2)
+        layout.addWidget(QLabel("Кэш временного"), 3, 0)
+        self.temporal_noise_combo = QComboBox()
+        self.temporal_noise_combo.setToolTip("Последние 10 временных карт текущего сеанса и размера кадра")
+        self.temporal_noise_combo.currentIndexChanged.connect(self._on_temporal_noise_selected)
+        layout.addWidget(self.temporal_noise_combo, 3, 1)
+        self.generate_temporal_button = QPushButton("Новая временная карта")
+        self.generate_temporal_button.clicked.connect(self._on_generate_temporal_clicked)
+        layout.addWidget(self.generate_temporal_button, 4, 0, 1, 2)
+
         self.fix_geometric_checkbox = QCheckBox("Фиксировать геометрический шум")
         self.fix_geometric_checkbox.setChecked(self.config["FIX_GEOMETRIC_NOISE"])
         self.fix_geometric_checkbox.stateChanged.connect(self._on_fix_geometric_changed)
-        layout.addWidget(self.fix_geometric_checkbox, 2, 0, 1, 2)
+        layout.addWidget(self.fix_geometric_checkbox, 5, 0, 1, 2)
+        layout.addWidget(QLabel("Кэш геометрического"), 6, 0)
+        self.geometric_noise_combo = QComboBox()
+        self.geometric_noise_combo.setToolTip("Последние 10 геометрических карт текущего сеанса и размера кадра")
+        self.geometric_noise_combo.currentIndexChanged.connect(self._on_geometric_noise_selected)
+        layout.addWidget(self.geometric_noise_combo, 6, 1)
         self.generate_geom_button = QPushButton("Новая карта геометрического шума")
         self.generate_geom_button.clicked.connect(self._on_generate_geometric_clicked)
-        layout.addWidget(self.generate_geom_button, 3, 0, 1, 2)
+        layout.addWidget(self.generate_geom_button, 7, 0, 1, 2)
+
+    def _refresh_noise_cache_controls(self, shape):
+        """Обновляет два выпадающих списка для текущего shape=(height,width).
+
+        Карты других размеров остаются в кэше, но не предлагаются, поскольку их
+        нельзя без изменения статистики наложить на текущий кадр.
+        """
+        self._refresh_noise_combo(
+            self.temporal_noise_combo, "temporal", "T",
+            self.simulator.temporal_noise_map_id, shape,
+        )
+        self._refresh_noise_combo(
+            self.geometric_noise_combo, "geometric", "G",
+            self.simulator.geometric_noise_map_id, shape,
+        )
+
+    def _refresh_noise_combo(self, combo, noise_kind, prefix, current_id, shape):
+        """Заполняет combo совместимыми записями одного кэша.
+
+        noise_kind выбирает историю, prefix формирует краткое имя, current_id
+        сохраняет выбранную карту, shape фильтрует несовместимые размеры.
+        """
+        records = self.simulator.noise_map_records(noise_kind, shape)
+        combo.blockSignals(True)
+        combo.clear()
+        for record in records:
+            height, width = record.shape
+            combo.addItem(f"{prefix}#{record.map_id} — {width}×{height}", record.map_id)
+        if records:
+            selected_index = combo.findData(current_id)
+            combo.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+            combo.setEnabled(True)
+        else:
+            combo.addItem("Нет совместимых карт", None)
+            combo.setEnabled(False)
+        combo.blockSignals(False)
 
     def _add_roi_controls(self, parent_layout):
         """Добавляет режим ROI, метод fit и обработку фоновой рамки.
@@ -377,6 +522,8 @@ class GaussianSimulatorWindow(QMainWindow):
             "background_lsb": np.clip(float(self.inputs["background_lsb"].value()), 0.0, max_code),
             "temporal_noise_lsb": max(float(self.inputs["temporal_noise_lsb"].value()), 0.0),
             "geometric_noise_lsb": max(float(self.inputs["geometric_noise_lsb"].value()), 0.0),
+            "fix_temporal_noise": self.fix_temporal_checkbox.isChecked(),
+            "fix_geometric_noise": self.fix_geometric_checkbox.isChecked(),
             "adc_bits": adc_bits,
             "lsb_per_picowatt": max(float(self.inputs["lsb_per_picowatt"].value()), 1e-12),
             "roi_mode": self.roi_mode_combo.currentData(),
@@ -400,8 +547,10 @@ class GaussianSimulatorWindow(QMainWindow):
         self.last_frame = self.simulator.simulate(
             params["width"], params["height"], params["x0"], params["y0"], params["sigma"],
             params["amplitude_lsb"], params["background_lsb"], params["temporal_noise_lsb"],
-            params["geometric_noise_lsb"], self.fix_geometric_checkbox.isChecked(), params["adc_bits"],
+            params["geometric_noise_lsb"], params["fix_geometric_noise"], params["adc_bits"],
+            params["fix_temporal_noise"],
         )
+        self._refresh_noise_cache_controls((params["height"], params["width"]))
         self.last_selection = select_roi(
             self.last_frame, params["roi_mode"], params["roi_size"], params["x0"], params["y0"],
             params["sigma"], params["background_lsb"],
@@ -579,6 +728,43 @@ class GaussianSimulatorWindow(QMainWindow):
         """
         self.update_model()
 
+    def _on_fix_temporal_changed(self, *_):
+        """Обрабатывает флажок фиксации временного шума.
+
+        *_ содержит состояние Qt; снятие флажка сбрасывает текущий выбор, после
+        чего пересчёт создаёт и кэширует новую независимую временную реализацию.
+        """
+        if not self.fix_temporal_checkbox.isChecked():
+            self.simulator.clear_temporal_noise()
+        self.update_model()
+
+    def _on_generate_temporal_clicked(self):
+        """Создаёт новую временную карту и сразу фиксирует её.
+
+        Размер берётся из интерфейса; карта попадает в начало кэша, после чего
+        выполняется один расчёт с этой же, а не следующей реализацией.
+        """
+        params = self._params()
+        self.simulator.generate_temporal_noise((params["height"], params["width"]))
+        self.fix_temporal_checkbox.blockSignals(True)
+        self.fix_temporal_checkbox.setChecked(True)
+        self.fix_temporal_checkbox.blockSignals(False)
+        self.update_model()
+
+    def _on_temporal_noise_selected(self, *_):
+        """Восстанавливает временную карту, выбранную пользователем в combo.
+
+        *_ принимает индекс Qt; найденная map_id становится текущей, а фиксация
+        включается без промежуточного расчёта с посторонней реализацией.
+        """
+        map_id = self.temporal_noise_combo.currentData()
+        if map_id is None or not self.simulator.select_noise_map("temporal", map_id):
+            return
+        self.fix_temporal_checkbox.blockSignals(True)
+        self.fix_temporal_checkbox.setChecked(True)
+        self.fix_temporal_checkbox.blockSignals(False)
+        self.update_model()
+
     def _on_fix_geometric_changed(self, *_):
         """Обрабатывает флажок фиксации геометрического шума.
 
@@ -595,6 +781,20 @@ class GaussianSimulatorWindow(QMainWindow):
         """
         params = self._params()
         self.simulator.generate_geometric_noise((params["height"], params["width"]))
+        self.fix_geometric_checkbox.blockSignals(True)
+        self.fix_geometric_checkbox.setChecked(True)
+        self.fix_geometric_checkbox.blockSignals(False)
+        self.update_model()
+
+    def _on_geometric_noise_selected(self, *_):
+        """Восстанавливает геометрическую карту, выбранную пользователем.
+
+        *_ принимает индекс Qt; map_id читается из combo, карта становится текущей,
+        и её фиксация включается перед единственным последующим пересчётом.
+        """
+        map_id = self.geometric_noise_combo.currentData()
+        if map_id is None or not self.simulator.select_noise_map("geometric", map_id):
+            return
         self.fix_geometric_checkbox.blockSignals(True)
         self.fix_geometric_checkbox.setChecked(True)
         self.fix_geometric_checkbox.blockSignals(False)

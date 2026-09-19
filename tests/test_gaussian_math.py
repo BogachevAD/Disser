@@ -138,6 +138,51 @@ class GaussianMathTests(unittest.TestCase):
         frame_sigma_5 = simulator.simulate(*common, 5.0, True, 16)
         np.testing.assert_allclose(frame_sigma_5 - 10_000.0, 2.5 * (frame_sigma_2 - 10_000.0))
 
+    def test_fixed_temporal_noise_reuses_exact_frame(self):
+        """Проверяет воспроизводимость кадра при фиксации временного шума.
+
+        Два полных расчёта с одинаковыми параметрами должны вернуть побитно
+        одинаковый кадр и создать только одну запись временной карты.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(43))
+        arguments = (8, 6, 3.2, 2.1, 0.8, 100.0, 10_000.0, 12.0, 0.0, True, 16, True)
+        first_frame = simulator.simulate(*arguments)
+        second_frame = simulator.simulate(*arguments)
+        np.testing.assert_array_equal(second_frame, first_frame)
+        self.assertEqual(len(simulator.temporal_noise_history), 1)
+
+    def test_noise_cache_keeps_ten_and_restores_by_seed(self):
+        """Проверяет глубину кэша и точное восстановление старой карты.
+
+        После 12 генераций остаются 10 последних записей; выбранный seed должен
+        восстановить тот же массив N(0,1), не сохраняя его копию в истории.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(44))
+        for _ in range(12):
+            simulator.generate_temporal_noise((4, 5))
+        self.assertEqual(len(simulator.temporal_noise_history), 10)
+        retained = simulator.temporal_noise_history[-1]
+        expected = np.random.default_rng(retained.seed).standard_normal(retained.shape)
+        self.assertTrue(simulator.select_noise_map("temporal", retained.map_id))
+        np.testing.assert_array_equal(simulator.temporal_noise, expected)
+        self.assertFalse(simulator.select_noise_map("temporal", -1))
+
+    def test_noise_histories_are_independent_and_filter_by_shape(self):
+        """Проверяет независимость двух кэшей и фильтрацию по размеру.
+
+        Temporal и geometric записи не смешиваются; запрос shape возвращает
+        только карты, совместимые с выбранным размером кадра.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(45))
+        simulator.generate_temporal_noise((3, 3))
+        simulator.generate_temporal_noise((5, 7))
+        simulator.generate_geometric_noise((3, 3))
+        self.assertEqual(len(simulator.temporal_noise_history), 2)
+        self.assertEqual(len(simulator.geometric_noise_history), 1)
+        records = simulator.noise_map_records("temporal", (3, 3))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].shape, (3, 3))
+
     def test_crop_at_edge_keeps_requested_shape(self):
         """Проверяет ROI около верхнего левого края.
 

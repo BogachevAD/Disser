@@ -5,7 +5,7 @@
 тестах, исследовательских сценариях и будущих модулях диссертации.
 """
 
-from gaussian_app import GaussianFrameSimulator, GaussianSimulatorApp, run_gaussian_simulator
+from gaussian_app import NoiseMapRecord, GaussianFrameSimulator, GaussianSimulatorApp, run_gaussian_simulator
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
     FIT_METHOD_QUADRANT_NELDER_MEAD,
@@ -35,6 +35,7 @@ from gaussian_math import (
 __all__ = [
     "GaussianFrameSimulator",
     "GaussianSimulatorApp",
+    "NoiseMapRecord",
     "BackgroundStatistics",
     "FIT_METHOD_NELDER_MEAD",
     "FIT_METHOD_QUADRANT_NELDER_MEAD",
