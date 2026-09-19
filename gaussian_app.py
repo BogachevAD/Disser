@@ -79,7 +79,8 @@ class GaussianFrameSimulator:
     temporal_noise_history: list[NoiseMapRecord] = field(default_factory=list)
     geometric_noise_map_id: int | None = None
     temporal_noise_map_id: int | None = None
-    noise_map_counter: int = 0
+    geometric_noise_map_counter: int = 0
+    temporal_noise_map_counter: int = 0
 
     def _generate_noise_map(self, shape, noise_kind):
         """Создаёт и кэширует единичную карту заданного noise_kind.
@@ -92,8 +93,10 @@ class GaussianFrameSimulator:
         shape = tuple(int(value) for value in shape)
         seed = int(self.rng.integers(0, np.iinfo(np.uint64).max, dtype=np.uint64))
         noise_map = np.random.default_rng(seed).standard_normal(shape)
-        self.noise_map_counter += 1
-        record = NoiseMapRecord(self.noise_map_counter, seed, shape)
+        counter_name = f"{noise_kind}_noise_map_counter"
+        map_id = getattr(self, counter_name)
+        setattr(self, counter_name, (map_id + 1) % 11)
+        record = NoiseMapRecord(map_id, seed, shape)
         history = getattr(self, f"{noise_kind}_noise_history")
         history.insert(0, record)
         del history[10:]

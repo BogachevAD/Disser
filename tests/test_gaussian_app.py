@@ -73,9 +73,14 @@ class GaussianAppNoiseTests(unittest.TestCase):
         window = self.make_window()
         try:
             initial_id = window.simulator.temporal_noise_map_id
+            self.assertEqual(initial_id, 0)
+            self.assertEqual(window.simulator.geometric_noise_map_id, 0)
+            self.assertTrue(window.temporal_noise_combo.currentText().startswith("T#0"))
+            self.assertTrue(window.geometric_noise_combo.currentText().startswith("G#0"))
             initial_frame = window.last_frame.copy()
             window.generate_temporal_button.click()
-            self.assertNotEqual(window.simulator.temporal_noise_map_id, initial_id)
+            self.assertEqual(window.simulator.temporal_noise_map_id, 1)
+            self.assertEqual(window.simulator.geometric_noise_map_id, 0)
             previous_index = window.temporal_noise_combo.findData(initial_id)
             self.assertGreaterEqual(previous_index, 0)
             window.temporal_noise_combo.setCurrentIndex(previous_index)

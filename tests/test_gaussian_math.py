@@ -183,6 +183,26 @@ class GaussianMathTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].shape, (3, 3))
 
+    def test_noise_map_numbers_are_independent_and_cycle_from_zero_to_ten(self):
+        """Проверяет отдельную нумерацию temporal и geometric в диапазоне 0–10.
+
+        Первые карты обоих типов имеют номер 0; после 10 каждый собственный
+        счётчик независимо возвращается к нулю без дубликатов внутри кэша из 10.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(46))
+        simulator.generate_temporal_noise((3, 3))
+        simulator.generate_geometric_noise((3, 3))
+        self.assertEqual(simulator.temporal_noise_map_id, 0)
+        self.assertEqual(simulator.geometric_noise_map_id, 0)
+
+        for _ in range(11):
+            simulator.generate_temporal_noise((3, 3))
+        self.assertEqual(simulator.temporal_noise_map_id, 0)
+        temporal_ids = [record.map_id for record in simulator.temporal_noise_history]
+        self.assertEqual(len(temporal_ids), len(set(temporal_ids)))
+        self.assertTrue(all(0 <= map_id <= 10 for map_id in temporal_ids))
+        self.assertEqual(simulator.geometric_noise_map_id, 0)
+
     def test_crop_at_edge_keeps_requested_shape(self):
         """Проверяет ROI около верхнего левого края.
 
