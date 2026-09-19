@@ -203,6 +203,54 @@ class GaussianMathTests(unittest.TestCase):
         self.assertTrue(all(0 <= map_id <= 10 for map_id in temporal_ids))
         self.assertEqual(simulator.geometric_noise_map_id, 0)
 
+    def test_zero_noise_does_not_create_or_number_maps(self):
+        """Исключает генерацию карт при нулевом СКО обоих шумов.
+
+        Несколько размеров и оба состояния фиксации не должны менять историю,
+        текущие map_id или независимые счётчики карт.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(47))
+        simulator.simulate(8, 6, 3.0, 2.0, 0.8, 100.0, 10.0, 0.0, 0.0, True, 16, True)
+        simulator.simulate(12, 10, 3.0, 2.0, 0.8, 100.0, 10.0, 0.0, 0.0, False, 16, False)
+        self.assertEqual(simulator.temporal_noise_history, [])
+        self.assertEqual(simulator.geometric_noise_history, [])
+        self.assertIsNone(simulator.temporal_noise_map_id)
+        self.assertIsNone(simulator.geometric_noise_map_id)
+        self.assertEqual(simulator.temporal_noise_map_counter, 0)
+        self.assertEqual(simulator.geometric_noise_map_counter, 0)
+        self.assertIsNone(simulator.generate_temporal_noise((3, 3), 0.0))
+        self.assertIsNone(simulator.generate_geometric_noise((3, 3), 0.0))
+
+    def test_fixed_maps_are_restored_after_temporary_frame_resize(self):
+        """Проверяет возврат карты при восстановлении прежнего размера кадра.
+
+        Для двух ненулевых фиксированных шумов размер B создаёт отдельные карты,
+        а возврат к A использует старые T#0/G#0 и воспроизводит исходный кадр.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(48))
+        common = (3.0, 2.0, 0.8, 100.0, 10_000.0, 5.0, 3.0, True, 16, True)
+        frame_a = simulator.simulate(8, 6, *common)
+        self.assertEqual((simulator.temporal_noise_map_id, simulator.geometric_noise_map_id), (0, 0))
+        simulator.simulate(10, 8, *common)
+        self.assertEqual((simulator.temporal_noise_map_id, simulator.geometric_noise_map_id), (1, 1))
+        restored_a = simulator.simulate(8, 6, *common)
+        self.assertEqual((simulator.temporal_noise_map_id, simulator.geometric_noise_map_id), (0, 0))
+        np.testing.assert_array_equal(restored_a, frame_a)
+
+    def test_clean_optical_frame_is_reused_when_only_noise_changes(self):
+        """Проверяет кэширование наиболее дорогой чистой оптической составляющей.
+
+        При одинаковых shape/x0/y0/sigma/сигнале/фоне новый временной шум меняет
+        итоговый кадр, но внутренний массив чистой ФРТ остаётся тем же объектом.
+        """
+        simulator = GaussianFrameSimulator(rng=np.random.default_rng(49))
+        arguments = (64, 48, 31.2, 23.8, 1.1, 1000.0, 20.0)
+        first = simulator.simulate(*arguments, 2.0, 0.0, True, 16, False)
+        cached_clean = simulator._clean_frame
+        second = simulator.simulate(*arguments, 2.0, 0.0, True, 16, False)
+        self.assertIs(simulator._clean_frame, cached_clean)
+        self.assertFalse(np.array_equal(first, second))
+
     def test_crop_at_edge_keeps_requested_shape(self):
         """Проверяет ROI около верхнего левого края.
 

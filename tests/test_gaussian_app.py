@@ -6,6 +6,7 @@ Qt запускается в offscreen-режиме: тесты проверяю
 
 import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -57,10 +58,52 @@ class GaussianAppNoiseTests(unittest.TestCase):
         window = self.make_window()
         try:
             initial_frame = window.last_frame.copy()
-            window.fit_method_combo.setCurrentIndex(1)
-            np.testing.assert_array_equal(window.last_frame, initial_frame)
-            window.ring_width_combo.setCurrentIndex(1)
-            np.testing.assert_array_equal(window.last_frame, initial_frame)
+            with patch.object(
+                window.simulator, "simulate", wraps=window.simulator.simulate,
+            ) as simulate_mock:
+                window.fit_method_combo.setCurrentIndex(1)
+                np.testing.assert_array_equal(window.last_frame, initial_frame)
+                window.ring_width_combo.setCurrentIndex(1)
+                np.testing.assert_array_equal(window.last_frame, initial_frame)
+                simulate_mock.assert_not_called()
+        finally:
+            window.close()
+
+    def test_zero_noise_resize_keeps_both_histories_empty(self):
+        """Проверяет интерфейс при нулевых уровнях и изменении размера кадра.
+
+        Кнопки новых карт отключены, изменение width не создаёт seed и оба списка
+        истории остаются пустыми независимо от установленных флажков фиксации.
+        """
+        config = dict(CONFIG)
+        config.update({"TEMPORAL_NOISE_LSB": 0.0, "GEOMETRIC_NOISE_LSB": 0.0})
+        window = GaussianSimulatorWindow(config)
+        try:
+            self.assertFalse(window.generate_temporal_button.isEnabled())
+            self.assertFalse(window.generate_geom_button.isEnabled())
+            window.inputs["width"].setValue(window.inputs["width"].value() + 1)
+            self.assertEqual(window.simulator.temporal_noise_history, [])
+            self.assertEqual(window.simulator.geometric_noise_history, [])
+            self.assertIsNone(window.simulator.temporal_noise_map_id)
+            self.assertIsNone(window.simulator.geometric_noise_map_id)
+        finally:
+            window.close()
+
+    def test_large_frame_preview_is_decimated_without_coordinate_change(self):
+        """Проверяет облегчённую отрисовку больших кадров.
+
+        Preview содержит меньше элементов, но extent остаётся в исходных индексах,
+        поэтому маркеры центра, ROI и фоновой рамки не получают смещения.
+        """
+        window = self.make_window()
+        try:
+            frame = np.zeros((1200, 800), dtype=float)
+            frame[1, 1] = 5.0
+            preview, extent, stride = window._frame_for_display(frame)
+            self.assertEqual(stride, 2)
+            self.assertEqual(preview.shape, (600, 400))
+            self.assertEqual(preview[0, 0], 5.0)
+            self.assertEqual(extent, (-0.5, 799.5, 1199.5, -0.5))
         finally:
             window.close()
 

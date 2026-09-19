@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import minimize
-from scipy.signal import fftconvolve
+from scipy.signal import correlate
 from scipy.special import ndtr
 
 
@@ -186,26 +186,47 @@ def crop_around_pixel(image, center_x, center_y, size=3):
     """
     image = _as_valid_image(image)
     _validate_odd_size(size)
+    return _crop_around_pixel_validated(image, center_x, center_y, size)
+
+
+def _crop_around_pixel_validated(image, center_x, center_y, size):
+    """Вырезает локальное окно из уже проверенного двумерного image.
+
+    center_x/center_y и size имеют контракт crop_around_pixel(). Дополнение
+    создаётся только вокруг малого ROI, а не вокруг всего исходного кадра.
+    """
     height, width = image.shape
     center_x = int(np.clip(center_x, 0, width - 1))
     center_y = int(np.clip(center_y, 0, height - 1))
     half = size // 2
-    padded = np.pad(image, half, mode="edge")
-    crop = padded[center_y:center_y + size, center_x:center_x + size]
-    return crop, center_x - half, center_y - half
+    origin_x, origin_y = center_x - half, center_y - half
+    source_x0, source_x1 = max(0, origin_x), min(width, center_x + half + 1)
+    source_y0, source_y1 = max(0, origin_y), min(height, center_y + half + 1)
+    crop = image[source_y0:source_y1, source_x0:source_x1]
+    padding = (
+        (max(0, -origin_y), max(0, center_y + half + 1 - height)),
+        (max(0, -origin_x), max(0, center_x + half + 1 - width)),
+    )
+    if any(before or after for before, after in padding):
+        crop = np.pad(crop, padding, mode="edge")
+    return crop, origin_x, origin_y
 
 
 def estimate_background_ring(
     image, center_x, center_y, roi_size=3, ring_width=1, ring_gap=0,
+    assume_valid=False,
 ):
     """Оценивает средний фон и его СКО по рамке вокруг ROI.
 
     image — полный кадр, center_x/center_y — центральный пиксель ROI, roi_size —
     его нечётный размер, ring_width — толщина рамки, ring_gap — защитный отступ
     от ROI. Пиксели сигнала и отступа исключаются; у границы используются только
-    реальные элементы кадра. Отступ уменьшает попадание хвостов ФРТ в фон.
+    реальные элементы кадра. assume_valid пропускает полный поиск NaN/Inf для
+    уже проверенного синтетического кадра и ускоряет интерактивный пересчёт.
     """
-    image = _as_valid_image(image)
+    image = np.asarray(image, dtype=float) if assume_valid else _as_valid_image(image)
+    if image.ndim != 2 or image.size == 0:
+        raise ValueError("image должна быть непустой двумерной матрицей")
     _validate_odd_size(roi_size)
     if not isinstance(ring_width, (int, np.integer)) or ring_width <= 0:
         raise ValueError("ring_width должен быть положительным целым числом")
@@ -244,7 +265,10 @@ def crop_around_position(image, x0, y0, size=3):
     image = _as_valid_image(image)
     center_x = nearest_pixel_center(x0, image.shape[1])
     center_y = nearest_pixel_center(y0, image.shape[0])
-    roi, origin_x, origin_y = crop_around_pixel(image, center_x, center_y, size)
+    _validate_odd_size(size)
+    roi, origin_x, origin_y = _crop_around_pixel_validated(
+        image, center_x, center_y, size,
+    )
     return RoiSelection(roi, center_x, center_y, origin_x, origin_y, ROI_MODE_TRUTH)
 
 
@@ -256,12 +280,23 @@ def matched_filter_response(image, sigma, background=0.0):
     соседних пикселей и устойчивее одиночного максимума к шуму.
     """
     image = _as_valid_image(image)
+    return _matched_filter_response_validated(image, sigma, background)
+
+
+def _matched_filter_response_validated(image, sigma, background):
+    """Вычисляет корреляцию для уже проверенного image.
+
+    sigma и background имеют смысл matched_filter_response(); scipy выбирает
+    прямой или FFT-метод автоматически в зависимости от кадра и размера ядра.
+    """
     if sigma <= 0:
         raise ValueError("sigma должна быть положительной")
     radius = max(1, int(np.ceil(3.0 * sigma)))
     kernel_size = 2 * radius + 1
     kernel = model_image((kernel_size, kernel_size), radius, radius, sigma)
-    return fftconvolve(image - float(background), kernel[::-1, ::-1], mode="same")
+    return correlate(
+        image - float(background), kernel, mode="same", method="auto",
+    )
 
 
 def crop_around_detected_target(image, sigma, background=0.0, size=3):
@@ -271,21 +306,49 @@ def crop_around_detected_target(image, sigma, background=0.0, size=3):
     последующей оценки. Максимум карты отклика определяет центральный пиксель.
     """
     image = _as_valid_image(image)
-    response = matched_filter_response(image, sigma, background)
+    response = _matched_filter_response_validated(image, sigma, background)
     center_y, center_x = np.unravel_index(np.argmax(response), response.shape)
-    roi, origin_x, origin_y = crop_around_pixel(image, center_x, center_y, size)
+    _validate_odd_size(size)
+    roi, origin_x, origin_y = _crop_around_pixel_validated(
+        image, center_x, center_y, size,
+    )
     return RoiSelection(
         roi, int(center_x), int(center_y), origin_x, origin_y,
         ROI_MODE_MATCHED_FILTER, response,
     )
 
 
-def select_roi(image, mode, size, x0, y0, sigma, background=0.0):
+def select_roi(image, mode, size, x0, y0, sigma, background=0.0, assume_valid=False):
     """Выбирает алгоритм формирования ROI для инженерной задачи.
 
     mode='truth' использует известные x0/y0 и проверяет модель; mode=
-    'matched_filter' игнорирует истинный центр и сначала обнаруживает сигнал.
+    'matched_filter' игнорирует истинный центр и сначала обнаруживает сигнал;
+    assume_valid включает быстрый путь для гарантированно корректного кадра.
     """
+    if assume_valid:
+        image = np.asarray(image, dtype=float)
+        if image.ndim != 2 or image.size == 0:
+            raise ValueError("image должна быть непустой двумерной матрицей")
+        _validate_odd_size(size)
+        if mode == ROI_MODE_TRUTH:
+            center_x = nearest_pixel_center(x0, image.shape[1])
+            center_y = nearest_pixel_center(y0, image.shape[0])
+            roi, origin_x, origin_y = _crop_around_pixel_validated(
+                image, center_x, center_y, size,
+            )
+            return RoiSelection(
+                roi, center_x, center_y, origin_x, origin_y, ROI_MODE_TRUTH,
+            )
+        if mode == ROI_MODE_MATCHED_FILTER:
+            response = _matched_filter_response_validated(image, sigma, background)
+            center_y, center_x = np.unravel_index(np.argmax(response), response.shape)
+            roi, origin_x, origin_y = _crop_around_pixel_validated(
+                image, center_x, center_y, size,
+            )
+            return RoiSelection(
+                roi, int(center_x), int(center_y), origin_x, origin_y,
+                ROI_MODE_MATCHED_FILTER, response,
+            )
     if mode == ROI_MODE_TRUTH:
         return crop_around_position(image, x0, y0, size)
     if mode == ROI_MODE_MATCHED_FILTER:

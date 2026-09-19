@@ -81,6 +81,8 @@ class GaussianFrameSimulator:
     temporal_noise_map_id: int | None = None
     geometric_noise_map_counter: int = 0
     temporal_noise_map_counter: int = 0
+    _clean_frame_signature: tuple | None = field(default=None, init=False, repr=False)
+    _clean_frame: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def _generate_noise_map(self, shape, noise_kind):
         """Создаёт и кэширует единичную карту заданного noise_kind.
@@ -132,6 +134,45 @@ class GaussianFrameSimulator:
                 return True
         return False
 
+    def _ensure_fixed_noise_map(self, shape, noise_kind):
+        """Возвращает текущую или последнюю совместимую фиксированную карту.
+
+        shape задаёт размер, noise_kind — temporal/geometric. При возврате к ранее
+        использованному размеру карта восстанавливается из истории, а не создаётся.
+        """
+        noise_map = getattr(self, f"{noise_kind}_noise")
+        if noise_map is not None and noise_map.shape == shape:
+            return noise_map
+        compatible_records = self.noise_map_records(noise_kind, shape)
+        if compatible_records:
+            self.select_noise_map(noise_kind, compatible_records[0].map_id)
+            return getattr(self, f"{noise_kind}_noise")
+        return self._generate_noise_map(shape, noise_kind)
+
+    def _make_clean_frame(self, shape, x0, y0, sigma, amplitude_lsb, background_lsb):
+        """Формирует или возвращает кэшированный кадр без шумов и ограничения АЦП.
+
+        Сигнатура включает геометрию и радиометрию ФРТ. При нулевой амплитуде
+        дорогое построение model_image пропускается и создаётся равномерный фон.
+        """
+        signature = (
+            shape, float(x0), float(y0), float(sigma),
+            float(amplitude_lsb), float(background_lsb),
+        )
+        if self._clean_frame is not None and signature == self._clean_frame_signature:
+            return self._clean_frame
+        if amplitude_lsb == 0:
+            clean = np.full(shape, float(background_lsb), dtype=float)
+        else:
+            gaussian = model_image(shape, x0, y0, sigma)
+            gaussian_peak = float(np.max(gaussian))
+            if gaussian_peak > 0:
+                gaussian /= gaussian_peak
+            clean = float(background_lsb) + float(amplitude_lsb) * gaussian
+        self._clean_frame_signature = signature
+        self._clean_frame = clean
+        return clean
+
     def clear_temporal_noise(self):
         """Снимает текущую фиксацию временного рисунка, сохраняя его в истории.
 
@@ -151,17 +192,21 @@ class GaussianFrameSimulator:
     def generate_temporal_noise(self, shape, temporal_noise_lsb=None):
         """Создаёт и кэширует единичную временную карту N(0,1).
 
-        shape задаёт размер; temporal_noise_lsb оставлен симметрично интерфейсу,
-        но масштаб применяется позднее, чтобы менять СКО при том же рисунке.
+        shape задаёт размер; при temporal_noise_lsb<=0 возвращается None без seed
+        и записи. Ненулевой масштаб применяется позднее при формировании кадра.
         """
+        if temporal_noise_lsb is not None and temporal_noise_lsb <= 0:
+            return None
         return self._generate_noise_map(shape, "temporal")
 
     def generate_geometric_noise(self, shape, geometric_noise_lsb=None):
         """Создаёт единичную карту N(0,1) размера shape=(height,width).
 
-        geometric_noise_lsb сохранён в сигнатуре для совместимости, но масштаб
-        применяется позднее: это позволяет менять sigma, не меняя рисунок карты.
+        При geometric_noise_lsb<=0 карта не создаётся; иначе масштаб применяется
+        позднее, что позволяет менять sigma, не меняя пространственный рисунок.
         """
+        if geometric_noise_lsb is not None and geometric_noise_lsb <= 0:
+            return None
         return self._generate_noise_map(shape, "geometric")
 
     def simulate(
@@ -173,34 +218,34 @@ class GaussianFrameSimulator:
 
         width/height задают размер; x0/y0/sigma — гауссову ФРТ; amplitude_lsb и
         background_lsb — пик и фон; два noise_lsb — СКО шумов; fix_* управляют
-        повторным использованием карт; adc_bits задаёт насыщение. Возвращается
-        float-матрица после сложения и ограничения АЦП.
+        повторным использованием карт; adc_bits задаёт насыщение. Нулевой шум
+        пропускается, чистая ФРТ кэшируется; возвращается float-матрица после АЦП.
         """
         shape = (height, width)
 
-        # Оптический блок: нормированная ФРТ переводится в пиковую амплитуду LSB.
-        gaussian = model_image(shape, x0, y0, sigma)
-        gaussian_peak = np.max(gaussian)
-        if gaussian_peak > 0:
-            gaussian = gaussian / gaussian_peak
-        clean = background_lsb + amplitude_lsb * gaussian
+        clean = self._make_clean_frame(
+            shape, x0, y0, sigma, amplitude_lsb, background_lsb,
+        )
+        frame = clean.copy()
 
-        # Каждый шум получает новую карту либо использует зафиксированную реализацию.
-        if fix_geometric_noise:
-            if self.geometric_noise is None or self.geometric_noise.shape != shape:
-                self.generate_geometric_noise(shape)
-            geometric = geometric_noise_lsb * self.geometric_noise
-        else:
-            geometric = geometric_noise_lsb * self.generate_geometric_noise(shape)
-        if fix_temporal_noise:
-            if self.temporal_noise is None or self.temporal_noise.shape != shape:
-                self.generate_temporal_noise(shape)
-            temporal = temporal_noise_lsb * self.temporal_noise
-        else:
-            temporal = temporal_noise_lsb * self.generate_temporal_noise(shape)
+        # Нулевой уровень не создаёт карту, seed или запись истории. Ненулевой
+        # фиксированный шум восстанавливает совместимую карту при возврате размера.
+        if geometric_noise_lsb > 0:
+            geometric = (
+                self._ensure_fixed_noise_map(shape, "geometric")
+                if fix_geometric_noise else self.generate_geometric_noise(shape)
+            )
+            frame += geometric_noise_lsb * geometric
+        if temporal_noise_lsb > 0:
+            temporal = (
+                self._ensure_fixed_noise_map(shape, "temporal")
+                if fix_temporal_noise else self.generate_temporal_noise(shape)
+            )
+            frame += temporal_noise_lsb * temporal
 
-        # АЦП отсекает отрицательные значения и насыщает сигнал максимальным кодом.
-        return np.clip(clean + geometric + temporal, 0.0, 2**adc_bits - 1)
+        # In-place clip не создаёт ещё один полноразмерный временный массив.
+        np.clip(frame, 0.0, 2**adc_bits - 1, out=frame)
+        return frame
 
 
 class GaussianSimulatorWindow(QMainWindow):
@@ -235,6 +280,7 @@ class GaussianSimulatorWindow(QMainWindow):
         ("Нелдер–Мид — взвешенный МНК", FIT_METHOD_NELDER_MEAD),
         ("Квадранты → Нелдер–Мид", FIT_METHOD_QUADRANT_NELDER_MEAD),
     ]
+    MAX_DISPLAY_SIDE = 1024
 
     def __init__(self, config):
         """Создаёт состояние модели, интерфейс и первый кадр.
@@ -251,6 +297,7 @@ class GaussianSimulatorWindow(QMainWindow):
         self.last_background_stats = None
         self.last_fit = None
         self.last_global_fit = None
+        self._last_frame_generation_signature = None
         self.calculation_index = 0
         self.inputs = {}
         self.setWindowTitle("Модель гауссова кадра и субпиксельной оценки")
@@ -562,6 +609,29 @@ class GaussianSimulatorWindow(QMainWindow):
             "use_ring_noise": self.use_noise_checkbox.isChecked(),
         }
 
+    def _frame_generation_signature(self, params):
+        """Возвращает ключ воспроизводимого кадра или None для нового шума.
+
+        params содержит параметры интерфейса. Нулевые шумы не входят в ключ;
+        ненулевой нефиксированный шум делает кадр невоспроизводимым и отключает кэш.
+        """
+        noise_keys = []
+        for noise_kind in ("temporal", "geometric"):
+            level = params[f"{noise_kind}_noise_lsb"]
+            fixed = params[f"fix_{noise_kind}_noise"]
+            if level <= 0:
+                noise_keys.append((noise_kind, "off"))
+            elif not fixed:
+                return None
+            else:
+                map_id = getattr(self.simulator, f"{noise_kind}_noise_map_id")
+                noise_keys.append((noise_kind, float(level), map_id))
+        return (
+            params["width"], params["height"], float(params["x0"]), float(params["y0"]),
+            float(params["sigma"]), float(params["amplitude_lsb"]),
+            float(params["background_lsb"]), params["adc_bits"], tuple(noise_keys),
+        )
+
     def update_model(self):
         """Последовательно генерирует кадр, выбирает ROI и оценивает ФРТ.
 
@@ -571,21 +641,30 @@ class GaussianSimulatorWindow(QMainWindow):
         """
         self.calculation_index += 1
         params = self._params()
-        self.last_frame = self.simulator.simulate(
-            params["width"], params["height"], params["x0"], params["y0"], params["sigma"],
-            params["amplitude_lsb"], params["background_lsb"], params["temporal_noise_lsb"],
-            params["geometric_noise_lsb"], params["fix_geometric_noise"], params["adc_bits"],
-            params["fix_temporal_noise"],
-        )
+        self.generate_temporal_button.setEnabled(params["temporal_noise_lsb"] > 0)
+        self.generate_geom_button.setEnabled(params["geometric_noise_lsb"] > 0)
+        requested_signature = self._frame_generation_signature(params)
+        if (
+            self.last_frame is None or requested_signature is None
+            or requested_signature != self._last_frame_generation_signature
+        ):
+            self.last_frame = self.simulator.simulate(
+                params["width"], params["height"], params["x0"], params["y0"], params["sigma"],
+                params["amplitude_lsb"], params["background_lsb"], params["temporal_noise_lsb"],
+                params["geometric_noise_lsb"], params["fix_geometric_noise"], params["adc_bits"],
+                params["fix_temporal_noise"],
+            )
+            self._last_frame_generation_signature = self._frame_generation_signature(params)
         self._refresh_noise_cache_controls((params["height"], params["width"]))
         self.last_selection = select_roi(
             self.last_frame, params["roi_mode"], params["roi_size"], params["x0"], params["y0"],
-            params["sigma"], params["background_lsb"],
+            params["sigma"], params["background_lsb"], assume_valid=True,
         )
         self.last_roi = self.last_selection.roi
         self.last_background_stats = estimate_background_ring(
             self.last_frame, self.last_selection.center_x, self.last_selection.center_y,
             params["roi_size"], params["ring_width"], params["ring_gap"],
+            assume_valid=True,
         )
         self.last_fit = fit_gaussian(
             self.last_roi,
@@ -609,8 +688,12 @@ class GaussianSimulatorWindow(QMainWindow):
         for axis in (self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis):
             axis.clear()
 
-        # Полный кадр показывает истинный центр (+) и центр выбранного ROI (квадрат).
-        self.frame_axis.imshow(self.last_frame, cmap="gray", vmin=0, vmax=2**params["adc_bits"] - 1)
+        # Расчёт остаётся полноразмерным, но большой экранный preview прореживается.
+        display_frame, display_extent, display_stride = self._frame_for_display(self.last_frame)
+        self.frame_axis.imshow(
+            display_frame, cmap="gray", vmin=0, vmax=2**params["adc_bits"] - 1,
+            extent=display_extent,
+        )
         self.frame_axis.plot(params["x0"], params["y0"], marker="+", color="cyan", markersize=9, mew=1.5)
         self.frame_axis.plot(
             self.last_selection.center_x, self.last_selection.center_y,
@@ -635,7 +718,8 @@ class GaussianSimulatorWindow(QMainWindow):
                     facecolor="none", linewidth=0.8, linestyle=linestyle,
                 )
             )
-        self.frame_axis.set_title("1. Кадр и выбранные области")
+        preview_note = f" (предпросмотр 1:{display_stride})" if display_stride > 1 else ""
+        self.frame_axis.set_title("1. Кадр и выбранные области" + preview_note)
 
         # ROI и модель используют одну шкалу LSB, поэтому их яркости сравнимы напрямую.
         signal_min = float(np.min(self.last_roi_without_background))
@@ -663,6 +747,25 @@ class GaussianSimulatorWindow(QMainWindow):
         self._set_matrix_table(self.fit_matrix, self.last_roi_without_background)
         self._set_matrix_table(self.model_matrix, self.last_fit["model_signal"])
         self.canvas.draw_idle()
+
+    def _frame_for_display(self, frame):
+        """Возвращает облегчённый preview frame и его исходную координатную шкалу.
+
+        Полноразмерная матрица расчёта не меняется. Для стороны больше
+        MAX_DISPLAY_SIDE берётся максимум каждого stride-блока, чтобы не потерять
+        узкое пятно между отсчётами; extent сохраняет исходные координаты x/y.
+        """
+        height, width = frame.shape
+        stride = max(1, int(np.ceil(max(height, width) / self.MAX_DISPLAY_SIDE)))
+        if stride == 1:
+            preview = frame
+        else:
+            row_starts = np.arange(0, height, stride)
+            column_starts = np.arange(0, width, stride)
+            preview = np.maximum.reduceat(frame, row_starts, axis=0)
+            preview = np.maximum.reduceat(preview, column_starts, axis=1)
+        extent = (-0.5, width - 0.5, height - 0.5, -0.5)
+        return preview, extent, stride
 
     def _draw_fit_overlay(self, roi_size):
         """Наносит локальный центр, окружность sigma и сетку 15×15.
@@ -762,7 +865,11 @@ class GaussianSimulatorWindow(QMainWindow):
         выполняется один расчёт с этой же, а не следующей реализацией.
         """
         params = self._params()
-        self.simulator.generate_temporal_noise((params["height"], params["width"]))
+        if params["temporal_noise_lsb"] <= 0:
+            return
+        self.simulator.generate_temporal_noise(
+            (params["height"], params["width"]), params["temporal_noise_lsb"],
+        )
         self.fix_temporal_checkbox.blockSignals(True)
         self.fix_temporal_checkbox.setChecked(True)
         self.fix_temporal_checkbox.blockSignals(False)
@@ -797,7 +904,11 @@ class GaussianSimulatorWindow(QMainWindow):
         Входных аргументов нет; фиксация включается и выполняется один пересчёт.
         """
         params = self._params()
-        self.simulator.generate_geometric_noise((params["height"], params["width"]))
+        if params["geometric_noise_lsb"] <= 0:
+            return
+        self.simulator.generate_geometric_noise(
+            (params["height"], params["width"]), params["geometric_noise_lsb"],
+        )
         self.fix_geometric_checkbox.blockSignals(True)
         self.fix_geometric_checkbox.setChecked(True)
         self.fix_geometric_checkbox.blockSignals(False)
