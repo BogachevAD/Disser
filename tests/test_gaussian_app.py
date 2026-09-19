@@ -11,8 +11,9 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QGroupBox, QTableWidget
 
+from algorithm_animation import AlgorithmAnimationDialog
 from gaussian_app import GaussianSimulatorWindow
 from run_gauss_simulator import CONFIG
 
@@ -81,6 +82,59 @@ class GaussianAppNoiseTests(unittest.TestCase):
             self.assertTrue(window.fix_temporal_checkbox.isChecked())
             np.testing.assert_array_equal(window.last_frame, initial_frame)
         finally:
+            window.close()
+
+    def test_matrix_tables_and_animation_button_layout(self):
+        """Проверяет замену текстовых полей таблицами и положение кнопки.
+
+        Три матрицы должны быть QTableWidget нужного размера, а кнопка анимации —
+        дочерним элементом группы выбора ROI, фона и алгоритма.
+        """
+        window = self.make_window()
+        try:
+            for table in (window.roi_matrix, window.fit_matrix, window.model_matrix):
+                self.assertIsInstance(table, QTableWidget)
+                self.assertEqual(table.rowCount(), 3)
+                self.assertEqual(table.columnCount(), 3)
+                self.assertIsNotNone(table.item(0, 0))
+            button_group = window.animation_button.parentWidget()
+            self.assertIsInstance(button_group, QGroupBox)
+            self.assertEqual(button_group.title(), "ROI, фон и оценивание")
+        finally:
+            window.close()
+
+    def test_combined_animation_is_side_by_side_and_initially_paused(self):
+        """Проверяет совместный экран квадрантов и Нелдера–Мида.
+
+        Слева всегда остаются квадранты, справа показана текущая итерация trace;
+        стрелки переключают кадры, а одна кнопка запускает и ставит на паузу.
+        """
+        window = self.make_window()
+        dialog = None
+        try:
+            window.fit_method_combo.setCurrentIndex(1)
+            dialog = AlgorithmAnimationDialog(window.last_fit, window)
+            self.assertFalse(dialog.timer.isActive())
+            self.assertEqual(dialog.play_button.text(), "▶ Старт")
+            self.assertEqual(len(dialog.frames), len(window.last_fit["optimization_trace"]))
+            self.assertIn("Квадрантная", dialog.left_axis.get_title())
+            self.assertIn("Нелдер–Мид", dialog.right_axis.get_title())
+
+            if len(dialog.frames) > 1:
+                dialog.next_button.click()
+                self.assertEqual(dialog.frame_index, 1)
+                self.assertFalse(dialog.timer.isActive())
+                dialog.previous_button.click()
+                self.assertEqual(dialog.frame_index, 0)
+                dialog.play_button.click()
+                self.assertTrue(dialog.timer.isActive())
+                self.assertEqual(dialog.play_button.text(), "⏸ Пауза")
+                dialog.play_button.click()
+                self.assertFalse(dialog.timer.isActive())
+                self.assertEqual(dialog.play_button.text(), "▶ Старт")
+        finally:
+            if dialog is not None:
+                dialog.close()
             window.close()
 
 

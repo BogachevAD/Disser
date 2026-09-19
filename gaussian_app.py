@@ -10,20 +10,22 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPushButton,
     QSpinBox,
-    QTextEdit,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -281,34 +283,28 @@ class GaussianSimulatorWindow(QMainWindow):
         root_layout.addWidget(self.position_label)
         root_layout.addWidget(self.radiometry_label)
 
+        # Общая сетка удерживает каждую численную таблицу под её изображением.
+        visual_grid = QGridLayout()
+        visual_grid.setHorizontalSpacing(10)
+        visual_grid.setVerticalSpacing(6)
+        root_layout.addLayout(visual_grid, stretch=1)
+        for column in range(4):
+            visual_grid.setColumnStretch(column, 1)
+
         # Четыре оси показывают полный кадр, ROI, оценку и модель в общей шкале LSB.
         self.figure = Figure(figsize=(14, 5), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
-        root_layout.addWidget(self.canvas, stretch=1)
+        visual_grid.addWidget(self.canvas, 0, 0, 1, 4)
         self.frame_axis, self.roi_axis, self.fit_axis, self.model_axis = self.figure.subplots(1, 4)
 
-        # Кнопка открывает воспроизводимую анимацию уже выполненного расчёта:
-        # новый шумовой кадр при этом не генерируется и результат не меняется.
-        animation_row = QHBoxLayout()
-        animation_row.addStretch(1)
-        self.animation_button = QPushButton("Показать работу алгоритма")
-        self.animation_button.clicked.connect(self._on_animation_clicked)
-        animation_row.addWidget(self.animation_button)
-        animation_row.addStretch(1)
-        root_layout.addLayout(animation_row)
-
-        # Нижние моноширинные поля позволяют численно сравнить три матрицы.
-        matrix_row = QHBoxLayout()
-        matrix_row.setSpacing(12)
-        root_layout.addLayout(matrix_row)
-        matrix_row.addStretch(1)
-        self.roi_matrix = self._make_matrix_box("Матрица изображения 2")
-        self.fit_matrix = self._make_matrix_box("Матрица изображения 3")
-        self.model_matrix = self._make_matrix_box("Матрица изображения 4")
-        matrix_row.addWidget(self.roi_matrix)
-        matrix_row.addWidget(self.fit_matrix)
-        matrix_row.addWidget(self.model_matrix)
-        matrix_row.addStretch(1)
+        # Под первым изображением таблицы нет; матрицы 2–4 занимают те же четверти.
+        visual_grid.addWidget(QWidget(), 1, 0)
+        roi_group, self.roi_matrix = self._make_matrix_table("Матрица изображения 2, LSB")
+        fit_group, self.fit_matrix = self._make_matrix_table("Матрица изображения 3, LSB")
+        model_group, self.model_matrix = self._make_matrix_table("Матрица изображения 4, LSB")
+        visual_grid.addWidget(roi_group, 1, 1)
+        visual_grid.addWidget(fit_group, 1, 2)
+        visual_grid.addWidget(model_group, 1, 3)
         self.setCentralWidget(root)
 
     def _add_group(self, parent_layout, title, fields):
@@ -469,18 +465,46 @@ class GaussianSimulatorWindow(QMainWindow):
         self.use_noise_checkbox.stateChanged.connect(self._on_value_changed)
         layout.addWidget(self.use_noise_checkbox, 6, 0, 1, 2)
 
-    def _make_matrix_box(self, title):
-        """Создаёт read-only поле численной матрицы.
+        # Кнопка относится к выбранному fit и поэтому расположена в этой группе.
+        self.animation_button = QPushButton("Показать работу алгоритма")
+        self.animation_button.setToolTip("Открыть пошаговую визуализацию последнего расчёта")
+        self.animation_button.clicked.connect(self._on_animation_clicked)
+        layout.addWidget(self.animation_button, 7, 0, 1, 2)
 
-        title — начальная подпись; возвращается настроенный QTextEdit.
+    def _make_matrix_table(self, title):
+        """Создаёт группу с read-only таблицей численной матрицы.
+
+        title подписывает связанную картинку; возвращаются QGroupBox и таблица,
+        которую _set_matrix_table() заполняет значениями и индексами пикселей.
         """
-        box = QTextEdit()
-        box.setReadOnly(True)
-        box.setFixedHeight(125)
-        box.setMinimumWidth(350)
-        box.setFont(QFont("Courier New", 9))
-        box.setText(title)
-        return box
+        group = QGroupBox(title)
+        layout = QVBoxLayout(group)
+        table = QTableWidget()
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setMinimumHeight(150)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(table)
+        return group, table
+
+    def _set_matrix_table(self, table, matrix):
+        """Заполняет table элементами двумерной matrix в инженерном формате.
+
+        Индексы строк и столбцов соответствуют локальным координатам ROI; каждый
+        QTableWidgetItem центрируется и выводит значение LSB с тремя знаками.
+        """
+        values = np.asarray(matrix, dtype=float)
+        rows, columns = values.shape
+        table.setRowCount(rows)
+        table.setColumnCount(columns)
+        table.setHorizontalHeaderLabels([f"x={index}" for index in range(columns)])
+        table.setVerticalHeaderLabels([f"y={index}" for index in range(rows)])
+        for row in range(rows):
+            for column in range(columns):
+                item = QTableWidgetItem(f"{values[row, column]:.3f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, item)
 
     def _make_spin_box(self, value_type, minimum, maximum, step, value):
         """Создаёт целый или вещественный spinbox.
@@ -608,7 +632,7 @@ class GaussianSimulatorWindow(QMainWindow):
                     facecolor="none", linewidth=0.8, linestyle=linestyle,
                 )
             )
-        self.frame_axis.set_title("1. Кадр: + задано, жёлтый ROI, пурпурная рамка")
+        self.frame_axis.set_title("1. Кадр и выбранные области")
 
         # ROI и модель используют одну шкалу LSB, поэтому их яркости сравнимы напрямую.
         signal_min = float(np.min(self.last_roi_without_background))
@@ -632,12 +656,9 @@ class GaussianSimulatorWindow(QMainWindow):
             axis.set_xticks([])
             axis.set_yticks([])
         self._update_info(params)
-        matrix_text = self._format_matrix(self.last_roi_without_background)
-        self.roi_matrix.setText("Матрица изображения 2, LSB\n" + matrix_text)
-        self.fit_matrix.setText("Матрица изображения 3, LSB\n" + matrix_text)
-        self.model_matrix.setText(
-            "Матрица изображения 4, LSB\n" + self._format_matrix(self.last_fit["model_signal"])
-        )
+        self._set_matrix_table(self.roi_matrix, self.last_roi_without_background)
+        self._set_matrix_table(self.fit_matrix, self.last_roi_without_background)
+        self._set_matrix_table(self.model_matrix, self.last_fit["model_signal"])
         self.canvas.draw_idle()
 
     def _draw_fit_overlay(self, roi_size):
@@ -713,13 +734,6 @@ class GaussianSimulatorWindow(QMainWindow):
             f"{self.last_fit['reduced_chi_square']:.3f}; задано σ={params['sigma']:.3f}, "
             f"оценено σ={self.last_fit['sigma']:.3f} px."
         )
-
-    def _format_matrix(self, matrix):
-        """Форматирует двумерную matrix для QTextEdit.
-
-        Каждый элемент выводится с тремя знаками и фиксированной шириной.
-        """
-        return "\n".join("  ".join(f"{value:10.3f}" for value in row) for row in matrix)
 
     def _on_value_changed(self, *_):
         """Обрабатывает изменение любого параметра.

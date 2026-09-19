@@ -1,8 +1,8 @@
-"""Всплывающая анимация квадрантной предобработки и Нелдера–Мида.
+"""Совместная пошаговая визуализация квадрантов и Нелдера–Мида.
 
-Диалог получает уже рассчитанный fit и ничего не переоценивает. Он последовательно
-показывает выбранные квадранты, сокращённую трассу лучших точек оптимизатора и
-соответствующие модели ФРТ, поэтому визуализация воспроизводима для данного кадра.
+Диалог получает уже рассчитанный fit и ничего не переоценивает. Для составного
+метода квадрантная предобработка постоянно показана слева, а сохранённые
+состояния Нелдера–Мида переключаются и воспроизводятся справа.
 """
 
 import numpy as np
@@ -26,13 +26,18 @@ QUADRANT_LABELS = {
 
 
 class AlgorithmAnimationDialog(QDialog):
-    """Показывает этапы последнего расчёта в отдельном PyQt6-окне.
+    """Показывает реперные итерации последнего расчёта в отдельном окне.
 
     fit_result содержит fit_signal, quadrant и optimization_trace; parent —
-    главное окно. Таймер перебирает только сохранённые реперные состояния.
+    главное окно. При открытии показана первая итерация, а таймер стоит на паузе.
     """
 
     def __init__(self, fit_result, parent=None):
+        """Сохраняет результат fit, создаёт плеер и рисует первый кадр.
+
+        fit_result не изменяется и повторно не вычисляется; parent задаёт владельца
+        диалога. Воспроизведение начинается только после нажатия кнопки старта.
+        """
         super().__init__(parent)
         self.fit_result = fit_result
         self.signal = np.asarray(fit_result["fit_signal"], dtype=float)
@@ -45,32 +50,28 @@ class AlgorithmAnimationDialog(QDialog):
         self.timer.timeout.connect(self._advance_frame)
 
         self.setWindowTitle("Как работает выбранный алгоритм")
-        self.resize(1000, 620)
+        self.resize(1080, 680)
         self._build_ui()
         self._draw_frame()
-        QTimer.singleShot(300, self._start_animation)
 
     def _build_frames(self):
-        """Формирует последовательность этапов из fit_result.
+        """Формирует кадры только из сохранённых состояний Нелдера–Мида.
 
-        Квадрантный кадр добавляется только для комбинированного метода; затем
-        идут сохранённые состояния Нелдера–Мида от начального к финальному.
+        Квадрантный этап не становится отдельным кадром: для составного метода он
+        остаётся слева на всём протяжении правой анимации. Пустая трасса даёт None.
         """
-        frames = []
-        if self.quadrant is not None:
-            frames.append(("quadrant", self.quadrant))
-        frames.extend(("nelder_mead", (index, state)) for index, state in enumerate(self.trace))
-        return frames or [("empty", None)]
+        return list(enumerate(self.trace)) or [(0, None)]
 
     def _build_ui(self):
-        """Создаёт холст, строку пояснения и кнопки управления.
+        """Создаёт две панели, пояснение и управление в стиле плеера.
 
-        Входных аргументов нет; созданные виджеты сохраняются в полях диалога.
+        Кнопки выполняют переход к началу, шаг назад/вперёд, старт/паузу и закрытие;
+        созданные виджеты сохраняются в self для синхронизации их состояния.
         """
         layout = QVBoxLayout(self)
-        self.figure = Figure(figsize=(10, 5), tight_layout=True)
+        self.figure = Figure(figsize=(10.8, 5.4), tight_layout=True)
         self.canvas = FigureCanvas(self.figure)
-        self.input_axis, self.model_axis = self.figure.subplots(1, 2)
+        self.left_axis, self.right_axis = self.figure.subplots(1, 2)
         layout.addWidget(self.canvas, stretch=1)
 
         self.stage_label = QLabel()
@@ -79,22 +80,33 @@ class AlgorithmAnimationDialog(QDialog):
 
         controls = QHBoxLayout()
         controls.addStretch(1)
-        self.restart_button = QPushButton("Сначала")
-        self.restart_button.clicked.connect(self._restart_animation)
-        controls.addWidget(self.restart_button)
-        self.play_button = QPushButton("Пауза")
+        self.first_button = QPushButton("⏮ Сначала")
+        self.first_button.setToolTip("Перейти к первой сохранённой итерации")
+        self.first_button.clicked.connect(self._go_to_first)
+        controls.addWidget(self.first_button)
+        self.previous_button = QPushButton("◀")
+        self.previous_button.setToolTip("Предыдущая итерация")
+        self.previous_button.clicked.connect(self._go_previous)
+        controls.addWidget(self.previous_button)
+        self.play_button = QPushButton("▶ Старт")
+        self.play_button.setToolTip("Запустить или приостановить анимацию")
         self.play_button.clicked.connect(self._toggle_animation)
         controls.addWidget(self.play_button)
+        self.next_button = QPushButton("▶")
+        self.next_button.setToolTip("Следующая итерация")
+        self.next_button.clicked.connect(self._go_next)
+        controls.addWidget(self.next_button)
         self.close_button = QPushButton("Закрыть")
         self.close_button.clicked.connect(self.accept)
         controls.addWidget(self.close_button)
+        controls.addStretch(1)
         layout.addLayout(controls)
 
     def _draw_signal(self, axis, title):
         """Рисует измеренный ROI на axis с пиксельной сеткой.
 
-        axis — Matplotlib Axes; title подписывает текущий этап. Общая шкала
-        сигнала сохраняется на всех кадрах анимации.
+        axis — Matplotlib Axes; title подписывает панель. Одинаковая signal
+        используется на всех итерациях, поэтому меняется только оценка параметров.
         """
         axis.imshow(self.signal, cmap="gray", interpolation="nearest")
         height, width = self.signal.shape
@@ -106,13 +118,13 @@ class AlgorithmAnimationDialog(QDialog):
         axis.set_yticks(range(height))
         axis.set_title(title)
 
-    def _draw_quadrants(self):
-        """Отображает четыре суммы и выделяет максимальные квадранты.
+    def _draw_quadrants(self, axis):
+        """Рисует квадрантную предобработку на переданной левой axis.
 
-        Данные берутся из self.quadrant; перекрытие по центральной строке и
-        столбцу соответствует математической функции quadrant_preprocess().
+        Цвет показывает выбранные квадранты, числа — четыре перекрывающиеся суммы,
+        красный крест — старт Нелдера–Мида, вычисленный quadrant_preprocess().
         """
-        self._draw_signal(self.input_axis, "ROI и четыре квадрантные суммы")
+        self._draw_signal(axis, "Квадрантная предобработка")
         height, width = self.signal.shape
         center_y, center_x = height // 2, width // 2
         bounds = {
@@ -124,7 +136,7 @@ class AlgorithmAnimationDialog(QDialog):
         selected = set(self.quadrant["selected_quadrants"])
         for name, (x, y, rectangle_width, rectangle_height) in bounds.items():
             is_selected = name in selected
-            self.input_axis.add_patch(
+            axis.add_patch(
                 patches.Rectangle(
                     (x, y), rectangle_width, rectangle_height,
                     edgecolor="lime" if is_selected else "orange",
@@ -133,144 +145,180 @@ class AlgorithmAnimationDialog(QDialog):
                     linewidth=2.4 if is_selected else 1.0,
                 )
             )
-            self.input_axis.text(
+            axis.text(
                 x + rectangle_width / 2, y + rectangle_height / 2,
                 f"{name}\n{self.quadrant['sums'][name]:.3f}",
                 color="lime" if is_selected else "orange", ha="center", va="center",
                 fontsize=10, fontweight="bold",
             )
-        self.input_axis.plot(
+        axis.plot(
             self.quadrant["x0_init"], self.quadrant["y0_init"],
             marker="x", color="red", markersize=10, mew=2,
         )
 
-        self.model_axis.axis("off")
-        selected_codes = " / ".join(self.quadrant["selected_quadrants"])
-        selected_names = ", ".join(
-            QUADRANT_LABELS[name] for name in self.quadrant["selected_quadrants"]
-        )
-        if len(self.quadrant["selected_quadrants"]) > 2:
-            selected_names = "\n".join(
-                QUADRANT_LABELS[name] for name in self.quadrant["selected_quadrants"]
-            )
-        self.model_axis.text(
-            0.03, 0.95,
-            "Квадрантная предобработка\n\n"
-            f"Выбрано: {selected_codes}\n"
-            f"({selected_names})\n"
-            f"Δx/Σ = {self.quadrant['delta_x']:+.4f}\n"
-            f"Δy/Σ = {self.quadrant['delta_y']:+.4f}\n"
-            f"Уверенность = {self.quadrant['confidence']:.4f}\n\n"
-            f"Старт Нелдера–Мида:\n"
-            f"x₀ = {self.quadrant['x0_init']:.4f}\n"
-            f"y₀ = {self.quadrant['y0_init']:.4f}\n"
-            f"Предполагаемый пиксель = "
-            f"({self.quadrant['coarse_pixel_x']}, {self.quadrant['coarse_pixel_y']})",
-            transform=self.model_axis.transAxes, va="top", fontsize=12,
-        )
-        self.stage_label.setText(
-            "Сначала сравниваются суммы четырёх перекрывающихся областей. "
-            "Красный крест задаёт стартовую координату; это ещё не итоговый fit."
-        )
+    def _draw_nelder_input(self, axis, state, trace_index):
+        """Рисует ROI и текущую лучшую точку обычного Нелдера–Мида.
 
-    def _draw_nelder_mead(self, state, trace_index):
-        """Рисует одно сохранённое состояние оптимизатора.
-
-        state содержит iteration, x0, y0, sigma и loss; trace_index нужен для
-        подписи прогресса. Справа строится соответствующая нормированная ФРТ.
+        axis получает изображение, state содержит x0/y0/sigma, trace_index задаёт
+        номер реперного состояния. Метод используется, когда квадрантного этапа нет.
         """
-        total_states = max(len(self.trace), 1)
-        self._draw_signal(
-            self.input_axis,
-            f"Этап 2. Нелдер–Мид: состояние {trace_index + 1}/{total_states}",
-        )
-        self.input_axis.plot(state["x0"], state["y0"], "rx", markersize=10, mew=2)
-        self.input_axis.add_patch(
+        self._draw_signal(axis, f"ROI: итерация Нелдера–Мида {trace_index + 1}/{len(self.frames)}")
+        axis.plot(state["x0"], state["y0"], "rx", markersize=10, mew=2)
+        axis.add_patch(
             patches.Circle(
                 (state["x0"], state["y0"]), state["sigma"],
                 edgecolor="red", facecolor="none", linestyle="--", linewidth=1.5,
             )
         )
 
+    def _draw_nelder_model(self, axis, state, trace_index):
+        """Рисует справа модель ФРТ для текущего состояния Нелдера–Мида.
+
+        axis — правая панель; state задаёт x0/y0/sigma/loss/iteration, а
+        trace_index используется в заголовке прогресса по сохранённым состояниям.
+        """
         model = model_image(self.signal.shape, state["x0"], state["y0"], state["sigma"])
         model *= np.sum(self.signal)
-        self.model_axis.imshow(model, cmap="gray", interpolation="nearest")
-        self.model_axis.plot(state["x0"], state["y0"], "rx", markersize=10, mew=2)
-        self.model_axis.set_xticks(range(self.signal.shape[1]))
-        self.model_axis.set_yticks(range(self.signal.shape[0]))
-        self.model_axis.set_title("Модель в текущей лучшей точке")
-        final = trace_index == len(self.trace) - 1
-        self.stage_label.setText(
-            f"{'Финальное решение' if final else 'Промежуточная лучшая точка'}: "
-            f"итерация {state['iteration']}, x₀={state['x0']:.5f}, "
-            f"y₀={state['y0']:.5f}, σ={state['sigma']:.5f}, J={state['loss']:.3e}. "
-            "Показаны реперные состояния, а не все операции с вершинами симплекса."
+        axis.imshow(model, cmap="gray", interpolation="nearest")
+        axis.plot(state["x0"], state["y0"], "rx", markersize=10, mew=2)
+        axis.add_patch(
+            patches.Circle(
+                (state["x0"], state["y0"]), state["sigma"],
+                edgecolor="red", facecolor="none", linestyle="--", linewidth=1.5,
+            )
         )
+        axis.set_xticks(range(self.signal.shape[1]))
+        axis.set_yticks(range(self.signal.shape[0]))
+        axis.set_title(f"Нелдер–Мид: состояние {trace_index + 1}/{len(self.frames)}")
 
     def _draw_frame(self):
-        """Перерисовывает текущий элемент self.frames.
+        """Перерисовывает обе панели для текущего frame_index.
 
-        frame_index выбирает квадрантный, оптимизационный или пустой этап;
-        после отрисовки холст обновляется без блокировки Qt event loop.
+        При наличии quadrant левая панель остаётся квадрантной, а правая меняется
+        по trace; для чистого Нелдера–Мида слева показан ROI с текущей оценкой.
         """
-        self.input_axis.clear()
-        self.model_axis.clear()
-        stage, payload = self.frames[self.frame_index]
-        if stage == "quadrant":
-            self._draw_quadrants()
-        elif stage == "nelder_mead":
-            trace_index, state = payload
-            self._draw_nelder_mead(state, trace_index)
+        self.left_axis.clear()
+        self.right_axis.clear()
+        trace_index, state = self.frames[self.frame_index]
+        if state is None:
+            self.left_axis.axis("off")
+            self.right_axis.axis("off")
+            self.stage_label.setText("Для текущего расчёта нет сохранённых итераций.")
         else:
-            self.input_axis.axis("off")
-            self.model_axis.axis("off")
-            self.stage_label.setText("Для текущего расчёта нет сохранённых этапов.")
+            if self.quadrant is not None:
+                self._draw_quadrants(self.left_axis)
+            else:
+                self._draw_nelder_input(self.left_axis, state, trace_index)
+            self._draw_nelder_model(self.right_axis, state, trace_index)
+            final = self.frame_index == len(self.frames) - 1
+            prefix = "Финальное решение" if final else "Промежуточная лучшая точка"
+            quadrant_text = ""
+            if self.quadrant is not None:
+                selected_names = ", ".join(
+                    QUADRANT_LABELS[name] for name in self.quadrant["selected_quadrants"]
+                )
+                quadrant_text = (
+                    f"Слева: выбраны {selected_names}; Δ/Σ="
+                    f"({self.quadrant['delta_x']:+.3f}, {self.quadrant['delta_y']:+.3f}), "
+                    f"уверенность={self.quadrant['confidence']:.3f}. "
+                )
+            self.stage_label.setText(
+                quadrant_text
+                + f"Справа — {prefix}: итерация {state['iteration']}, "
+                  f"x₀={state['x0']:.5f}, y₀={state['y0']:.5f}, "
+                  f"σ={state['sigma']:.5f}, J={state['loss']:.3e}. "
+                  "Показаны реперные состояния, а не все операции симплекса."
+            )
         self.figure.suptitle(
-            f"Работа алгоритма — кадр {self.frame_index + 1} из {len(self.frames)}",
+            f"Работа алгоритма — итерация {self.frame_index + 1} из {len(self.frames)}",
             fontsize=13,
         )
+        self._update_player_controls()
         self.canvas.draw_idle()
 
-    def _advance_frame(self):
-        """Переходит к следующему кадру таймера или останавливается в конце.
+    def _update_player_controls(self):
+        """Синхронизирует доступность кнопок с текущей позицией плеера.
 
-        Входных аргументов нет; меняются frame_index, timer и подпись play_button.
+        Входных переменных нет; first/previous блокируются в начале, next — в конце,
+        а старт недоступен, если оптимизатор сохранил только одно состояние.
+        """
+        at_start = self.frame_index == 0
+        at_end = self.frame_index >= len(self.frames) - 1
+        self.first_button.setEnabled(not at_start)
+        self.previous_button.setEnabled(not at_start)
+        self.next_button.setEnabled(not at_end)
+        self.play_button.setEnabled(len(self.frames) > 1)
+
+    def _pause_animation(self):
+        """Останавливает таймер и переводит общую кнопку в состояние «Старт».
+
+        Входных аргументов нет; текущий frame_index и изображение не изменяются.
+        """
+        self.timer.stop()
+        self.play_button.setText("▶ Старт")
+
+    def _advance_frame(self):
+        """Переходит к следующему кадру таймера и останавливается в конце.
+
+        Входных аргументов нет; frame_index увеличивается на один, после последней
+        итерации таймер выключается и плеер остаётся на финальном результате.
         """
         if self.frame_index >= len(self.frames) - 1:
-            self.timer.stop()
-            self.play_button.setText("Повторить")
+            self._pause_animation()
             return
         self.frame_index += 1
         self._draw_frame()
+        if self.frame_index >= len(self.frames) - 1:
+            self._pause_animation()
 
     def _start_animation(self):
-        """Запускает таймер, если в последовательности больше одного кадра.
+        """Запускает воспроизведение с текущей или первой итерации.
 
-        Функция вызывается после показа окна и обновляет подпись кнопки паузы.
+        Если плеер находится в конце, frame_index сначала сбрасывается в ноль;
+        затем запускается QTimer, а единственная кнопка меняется на «Пауза».
         """
-        if len(self.frames) > 1:
-            self.timer.start()
-            self.play_button.setText("Пауза")
+        if len(self.frames) <= 1:
+            return
+        if self.frame_index >= len(self.frames) - 1:
+            self.frame_index = 0
+            self._draw_frame()
+        self.timer.start()
+        self.play_button.setText("⏸ Пауза")
 
-    def _restart_animation(self):
-        """Возвращает анимацию к первому этапу и запускает её заново.
+    def _go_to_first(self):
+        """Ставит воспроизведение на паузу и показывает первую итерацию.
 
-        Входных аргументов нет; старый таймер безопасно перезапускается.
+        Входных аргументов нет; действие соответствует кнопке «Сначала» плеера.
         """
-        self.timer.stop()
+        self._pause_animation()
         self.frame_index = 0
         self._draw_frame()
-        self._start_animation()
+
+    def _go_previous(self):
+        """Ставит плеер на паузу и выполняет один шаг влево.
+
+        Индекс ограничивается нулём, поэтому повторное нажатие в начале безопасно.
+        """
+        self._pause_animation()
+        self.frame_index = max(0, self.frame_index - 1)
+        self._draw_frame()
+
+    def _go_next(self):
+        """Ставит плеер на паузу и выполняет один шаг вправо.
+
+        Индекс ограничивается последним кадром, поэтому выйти за trace невозможно.
+        """
+        self._pause_animation()
+        self.frame_index = min(len(self.frames) - 1, self.frame_index + 1)
+        self._draw_frame()
 
     def _toggle_animation(self):
-        """Переключает воспроизведение между паузой, продолжением и повтором.
+        """Переключает единственную кнопку между стартом и паузой.
 
-        Текущее состояние QTimer и последний frame_index определяют действие.
+        Активный timer останавливается; при паузе запускается продолжение, а из
+        последней итерации воспроизведение автоматически начинается сначала.
         """
         if self.timer.isActive():
-            self.timer.stop()
-            self.play_button.setText("Продолжить")
-        elif self.frame_index >= len(self.frames) - 1:
-            self._restart_animation()
+            self._pause_animation()
         else:
             self._start_animation()
