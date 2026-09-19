@@ -12,6 +12,8 @@ from gaussian_app import GaussianFrameSimulator
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
     FIT_METHOD_QUADRANT_NELDER_MEAD,
+    FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD,
+    FIT_METHOD_ROBUST_NELDER_MEAD,
     crop_around_detected_target,
     crop_around_max,
     crop_around_pixel,
@@ -359,6 +361,108 @@ class GaussianMathTests(unittest.TestCase):
             [corrected["x0"], corrected["y0"], corrected["sigma"]], atol=1e-10,
         )
         self.assertTrue(np.isnan(without_noise_scale["reduced_chi_square"]))
+
+    def test_robust_fit_profiles_amplitude_and_background_in_raw_lsb(self):
+        """Проверяет совместную оценку x0/y0/sigma/A/B без обрезки данных.
+
+        Фон и амплитуда не передаются как известные параметры модели; рамка
+        задаёт лишь мягкую оценку B и масштаб шума для Huber-функционала.
+        """
+        expected = (1.2, 0.8, 0.6)
+        amplitude, background = 5_000.0, 1_000.0
+        roi = background + amplitude * model_image((3, 3), *expected)
+        result = fit_gaussian(
+            roi, FIT_METHOD_ROBUST_NELDER_MEAD,
+            background_level=background, subtract_background=True,
+            noise_sigma=20.0, background_prior_sigma=5.0,
+        )
+        self.assertTrue(result["success"])
+        self.assertTrue(result["robust"])
+        np.testing.assert_allclose(
+            [result["x0"], result["y0"], result["sigma"]], expected, atol=2e-5,
+        )
+        self.assertAlmostEqual(result["A"], amplitude, places=2)
+        self.assertAlmostEqual(result["fitted_background"], background, places=2)
+        self.assertTrue(result["background_prior_used"])
+
+    def test_huber_fit_rejects_single_bright_outlier_in_three_by_three_roi(self):
+        """Сравнивает старую и робастную оценки при одиночном выбросе.
+
+        В левый верхний отсчёт 3×3 добавлена помеха 1500 LSB. Старое
+        яркостное взвешивание принимает её за часть ФРТ, а Huber снижает вес.
+        """
+        expected = (1.2, 0.8, 0.6)
+        roi = 1_000.0 + 5_000.0 * model_image((3, 3), *expected)
+        roi[0, 0] += 1_500.0
+        legacy = fit_gaussian(
+            roi, FIT_METHOD_NELDER_MEAD, background_level=1_000.0,
+            subtract_background=True, noise_sigma=20.0,
+        )
+        robust = fit_gaussian(
+            roi, FIT_METHOD_ROBUST_NELDER_MEAD, background_level=1_000.0,
+            subtract_background=True, noise_sigma=20.0,
+            background_prior_sigma=5.0,
+        )
+        self.assertLess(abs(robust["sigma"] - expected[2]), abs(legacy["sigma"] - expected[2]))
+        self.assertLess(abs(robust["sigma"] - expected[2]), 0.01)
+        self.assertEqual(robust["outlier_count"], 1)
+        self.assertEqual(robust["outlier_coordinates"], [(0, 0)])
+        self.assertLess(robust["robust_weights"][0, 0], 0.1)
+
+    def test_quadrant_robust_fit_uses_quadrant_only_as_initialization(self):
+        """Проверяет полный метод квадранты → robust Nelder–Mead.
+
+        Итоговый центр является непрерывной оценкой и не зажат выбранным
+        квадрантом; трасса дополнительно хранит профилированные A и B.
+        """
+        expected = (1.7, 0.3, 0.8)
+        roi = 700.0 + 4_000.0 * model_image((3, 3), *expected)
+        result = fit_gaussian(
+            roi, FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD,
+            background_level=700.0, subtract_background=True,
+            noise_sigma=10.0, background_prior_sigma=2.0,
+        )
+        self.assertEqual(result["quadrant"]["selected_quadrants"], ["RT"])
+        np.testing.assert_allclose(
+            [result["x0"], result["y0"], result["sigma"]], expected, atol=3e-5,
+        )
+        self.assertIn("amplitude", result["optimization_trace"][0])
+        self.assertIn("background", result["optimization_trace"][0])
+
+    def test_robust_fit_has_no_optics_derived_sigma_bounds(self):
+        """Проверяет свободную оценку широкой ФРТ без априорного диапазона.
+
+        sigma=3 px восстанавливается из ROI 7×7; в алгоритм не передаются
+        параметры объектива, длина волны или допустимые min/max ширины.
+        """
+        expected = (3.2, 2.8, 3.0)
+        roi = 500.0 + 9_000.0 * model_image((7, 7), *expected)
+        result = fit_gaussian(
+            roi, FIT_METHOD_ROBUST_NELDER_MEAD, background_level=500.0,
+            subtract_background=True, noise_sigma=1e-3,
+            background_prior_sigma=1e-3,
+        )
+        self.assertTrue(result["success"])
+        np.testing.assert_allclose(
+            [result["x0"], result["y0"], result["sigma"]], expected, atol=2e-5,
+        )
+
+    def test_background_ring_reports_robust_statistics_under_an_outlier(self):
+        """Проверяет устойчивые median/MAD при выбросе в фоновой рамке.
+
+        Среднее и обычное СКО должны измениться, тогда как медиана и robust_std
+        сохраняют уровень основной совокупности фоновых пикселей.
+        """
+        image = np.full((11, 11), 1_000.0)
+        image[2, 5] = 50_000.0
+        statistics = estimate_background_ring(
+            image, 5, 5, roi_size=3, ring_width=2, ring_gap=0,
+        )
+        self.assertGreater(statistics.mean, statistics.median)
+        self.assertGreater(statistics.std, 0.0)
+        self.assertEqual(statistics.median, 1_000.0)
+        self.assertEqual(statistics.mad, 0.0)
+        self.assertEqual(statistics.robust_std, 0.0)
 
 
 if __name__ == "__main__":

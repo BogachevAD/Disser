@@ -148,6 +148,9 @@ class GaussianAppNoiseTests(unittest.TestCase):
             button_group = window.animation_button.parentWidget()
             self.assertIsInstance(button_group, QGroupBox)
             self.assertEqual(button_group.title(), "ROI, фон и оценивание")
+            self.assertEqual(window.fit_method_combo.count(), 4)
+            self.assertIn("Робастный", window.fit_method_combo.itemText(2))
+            self.assertIn("робастный", window.fit_method_combo.itemText(3))
         finally:
             window.close()
 

@@ -39,6 +39,8 @@ from matplotlib.figure import Figure
 from gaussian_math import (
     FIT_METHOD_NELDER_MEAD,
     FIT_METHOD_QUADRANT_NELDER_MEAD,
+    FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD,
+    FIT_METHOD_ROBUST_NELDER_MEAD,
     ROI_MODE_MATCHED_FILTER,
     ROI_MODE_TRUTH,
     estimate_background_ring,
@@ -279,6 +281,8 @@ class GaussianSimulatorWindow(QMainWindow):
     FIT_METHODS = [
         ("Нелдер–Мид — взвешенный МНК", FIT_METHOD_NELDER_MEAD),
         ("Квадранты → Нелдер–Мид", FIT_METHOD_QUADRANT_NELDER_MEAD),
+        ("Робастный Нелдер–Мид — Huber", FIT_METHOD_ROBUST_NELDER_MEAD),
+        ("Квадранты → робастный Нелдер–Мид", FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD),
     ]
     MAX_DISPLAY_SIDE = 1024
 
@@ -499,18 +503,18 @@ class GaussianSimulatorWindow(QMainWindow):
         self.ring_gap_combo.currentIndexChanged.connect(self._on_value_changed)
         layout.addWidget(self.ring_gap_combo, 4, 1)
 
-        self.subtract_background_checkbox = QCheckBox("Вычитать средний фон по рамке")
+        self.subtract_background_checkbox = QCheckBox("Использовать фон рамки")
         self.subtract_background_checkbox.setChecked(self.config.get("SUBTRACT_RING_BACKGROUND", True))
         self.subtract_background_checkbox.setToolTip(
-            "Вычитается среднее значение рамки; случайная реализация шума в ROI при этом остаётся."
+            "Legacy: жёстко вычитается mean. Robust: median используется как мягкий prior для совместной оценки B."
         )
         self.subtract_background_checkbox.stateChanged.connect(self._on_value_changed)
         layout.addWidget(self.subtract_background_checkbox, 5, 0, 1, 2)
 
-        self.use_noise_checkbox = QCheckBox("Учитывать СКО рамки в SNR и χ²")
+        self.use_noise_checkbox = QCheckBox("Учитывать СКО рамки в fit, SNR и χ²")
         self.use_noise_checkbox.setChecked(self.config.get("USE_RING_NOISE", True))
         self.use_noise_checkbox.setToolTip(
-            "Одно и то же СКО для всех пикселей не меняет минимум, но задаёт физический масштаб SNR и χ²."
+            "Legacy: масштаб SNR/χ². Robust: σrob также задаёт порог Huber для подавления выбросов."
         )
         self.use_noise_checkbox.stateChanged.connect(self._on_value_changed)
         layout.addWidget(self.use_noise_checkbox, 6, 0, 1, 2)
@@ -666,12 +670,37 @@ class GaussianSimulatorWindow(QMainWindow):
             params["roi_size"], params["ring_width"], params["ring_gap"],
             assume_valid=True,
         )
+        robust_method = params["fit_method"] in {
+            FIT_METHOD_ROBUST_NELDER_MEAD,
+            FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD,
+        }
+        background_level = (
+            self.last_background_stats.median
+            if robust_method else self.last_background_stats.mean
+        )
+        noise_sigma = None
+        if params["use_ring_noise"]:
+            candidate_sigma = (
+                self.last_background_stats.robust_std
+                if robust_method else self.last_background_stats.std
+            )
+            # Нулевое СКО идеального кадра заменяется только численным floor;
+            # это не ограничение sigma ФРТ и не добавление физического шума.
+            noise_sigma = max(candidate_sigma, 1e-6)
+        background_prior_sigma = None
+        if robust_method and params["subtract_background"]:
+            robust_std = self.last_background_stats.robust_std
+            background_prior_sigma = max(
+                1.2533 * robust_std / np.sqrt(self.last_background_stats.pixel_count),
+                1e-6,
+            )
         self.last_fit = fit_gaussian(
             self.last_roi,
             method=params["fit_method"],
-            background_level=self.last_background_stats.mean,
+            background_level=background_level,
             subtract_background=params["subtract_background"],
-            noise_sigma=self.last_background_stats.std if params["use_ring_noise"] else None,
+            noise_sigma=noise_sigma,
+            background_prior_sigma=background_prior_sigma,
         )
         self.last_roi_without_background = self.last_fit["fit_signal"]
         self.last_global_fit = local_to_global(
@@ -790,6 +819,13 @@ class GaussianSimulatorWindow(QMainWindow):
                 coordinate, xmin=center / roi_size, xmax=(center + 1) / roi_size,
                 color="cyan", linewidth=0.35, alpha=0.75,
             )
+        outlier_mask = self.last_fit.get("outlier_mask")
+        if outlier_mask is not None:
+            for row, column in np.argwhere(outlier_mask):
+                self.fit_axis.plot(
+                    column, row, marker="s", markerfacecolor="none",
+                    markeredgecolor="orange", markersize=12, mew=1.8,
+                )
 
     def _update_info(self, params):
         """Выводит ошибку центра, качество fit и мощности.
@@ -820,6 +856,15 @@ class GaussianSimulatorWindow(QMainWindow):
                   f"{quadrant['delta_y']:+.3f}); старт=({quadrant['x0_init']:.3f}, "
                   f"{quadrant['y0_init']:.3f}); уверенность={quadrant['confidence']:.3f}."
             )
+        if self.last_fit.get("robust"):
+            outliers = self.last_fit.get("outlier_coordinates", [])
+            self.position_label.setText(
+                self.position_label.text()
+                + f" Робастный fit: B={self.last_fit['fitted_background']:.3f} LSB; "
+                  f"масштаб={self.last_fit['robust_scale']:.3f} LSB; "
+                  f"выбросов={len(outliers)}"
+                  + (f" {outliers}." if outliers else ".")
+            )
         warning = (not self.last_fit["success"]) or center_error > 0.75
         self.position_label.setStyleSheet("color: #b00020;" if warning else "color: #146c2e;")
 
@@ -833,9 +878,10 @@ class GaussianSimulatorWindow(QMainWindow):
             f"временной σ={params['temporal_noise_lsb']:.3f} LSB ({temporal_watts:.3e} Вт); "
             f"геометрический σ={params['geometric_noise_lsb']:.3f} LSB ({geometric_watts:.3e} Вт); "
             f"рамка: mean={self.last_background_stats.mean:.3f}, median="
-            f"{self.last_background_stats.median:.3f}, σ={self.last_background_stats.std:.3f} LSB, "
+            f"{self.last_background_stats.median:.3f}, σ={self.last_background_stats.std:.3f}, "
+            f"σrob={self.last_background_stats.robust_std:.3f} LSB, "
             f"N={self.last_background_stats.pixel_count}, отступ={params['ring_gap']} px; фон "
-            f"{'вычтен' if params['subtract_background'] else 'не вычтен'}; "
+            f"{'задан мягким prior' if self.last_fit.get('background_prior_used') else ('вычтен' if params['subtract_background'] else 'не вычтен')}; "
             f"SNRpeak={self.last_fit['snr_peak']:.3f}, χ²red="
             f"{self.last_fit['reduced_chi_square']:.3f}; задано σ={params['sigma']:.3f}, "
             f"оценено σ={self.last_fit['sigma']:.3f} px."

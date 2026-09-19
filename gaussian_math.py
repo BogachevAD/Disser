@@ -17,6 +17,8 @@ ROI_MODE_TRUTH = "truth"
 ROI_MODE_MATCHED_FILTER = "matched_filter"
 FIT_METHOD_NELDER_MEAD = "nelder_mead"
 FIT_METHOD_QUADRANT_NELDER_MEAD = "quadrant_nelder_mead"
+FIT_METHOD_ROBUST_NELDER_MEAD = "robust_nelder_mead"
+FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD = "quadrant_robust_nelder_mead"
 
 
 @dataclass(frozen=True)
@@ -41,14 +43,16 @@ class RoiSelection:
 class BackgroundStatistics:
     """Статистика пиксельной рамки вокруг выбранного ROI.
 
-    mean/median — оценки уровня фона в LSB, std — выборочное СКО флуктуаций,
-    pixel_count — число реально использованных пикселей без дополнения границ.
+    mean/median — оценки фона в LSB, std — обычное выборочное СКО, mad и
+    robust_std — робастные масштабы отклонений, pixel_count — число пикселей.
     """
 
     mean: float
     median: float
     std: float
     pixel_count: int
+    mad: float = 0.0
+    robust_std: float = 0.0
 
 
 def _as_valid_image(image, name="image"):
@@ -247,12 +251,20 @@ def estimate_background_ring(
     values = window[(radius > ring_inner_radius) & (radius <= outer_half)]
     if values.size == 0:
         raise ValueError("Рамка не содержит пикселей")
+    median = float(np.median(values))
     std = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+    absolute_deviations = np.abs(values - median)
+    mad = float(np.median(absolute_deviations))
+    mad_std = 1.4826 * mad
+    quantile_std = float(np.quantile(absolute_deviations, 0.682689492))
+    robust_std = max(mad_std, quantile_std)
     return BackgroundStatistics(
         mean=float(np.mean(values)),
-        median=float(np.median(values)),
+        median=median,
         std=std,
         pixel_count=int(values.size),
+        mad=mad,
+        robust_std=robust_std,
     )
 
 
@@ -579,6 +591,320 @@ def _fit_gaussian_nelder_mead(
     }
 
 
+def _huber_values(standardized_residuals, delta=1.5):
+    """Возвращает значения функции потерь Хьюбера для residuals.
+
+    standardized_residuals измерены в СКО шума, delta задаёт переход от
+    квадратичного режима нормальных отсчётов к линейному режиму выбросов.
+    """
+    residuals = np.asarray(standardized_residuals, dtype=float)
+    absolute = np.abs(residuals)
+    return np.where(
+        absolute <= delta,
+        0.5 * residuals**2,
+        delta * (absolute - 0.5 * delta),
+    )
+
+
+def _huber_weights(standardized_residuals, delta=1.5):
+    """Вычисляет IRLS-веса Хьюбера по стандартизованным остаткам.
+
+    Остатки внутри delta получают вес 1, а влияние выброса убывает как
+    delta/|r|. Нулевые остатки обрабатываются без деления на ноль.
+    """
+    residuals = np.asarray(standardized_residuals, dtype=float)
+    absolute = np.abs(residuals)
+    weights = np.ones_like(absolute)
+    outliers = absolute > delta
+    weights[outliers] = delta / absolute[outliers]
+    return weights
+
+
+def _robust_scale(values, supplied_scale=None):
+    """Возвращает положительный масштаб шума для робастных остатков.
+
+    supplied_scale обычно приходит из рамки. Без него используются MAD и
+    68.27%-квантиль абсолютных отклонений; машинный floor только исключает ноль.
+    """
+    if supplied_scale is not None and np.isfinite(supplied_scale) and supplied_scale > 0:
+        return float(supplied_scale)
+    array = np.asarray(values, dtype=float)
+    median = float(np.median(array))
+    deviations = np.abs(array - median)
+    mad_scale = 1.4826 * float(np.median(deviations))
+    quantile_scale = float(np.quantile(deviations, 0.682689492))
+    data_scale = max(mad_scale, quantile_scale)
+    numerical_floor = max(float(np.ptp(array)) * 1e-12, np.finfo(float).eps)
+    return max(data_scale, numerical_floor)
+
+
+def _profile_amplitude_background(
+    pixels, gaussian, noise_scale, background_prior, background_prior_sigma,
+    huber_delta=1.5, maximum_irls_iterations=8,
+):
+    """Профилирует амплитуду A и фон B для фиксированной формы gaussian.
+
+    pixels и gaussian разворачиваются в векторы модели D=A*G+B. IRLS подавляет
+    выбросы; необязательный background_prior добавляет мягкое наблюдение фона.
+    Возвращаются A, B, стандартизованные остатки и финальные робастные веса.
+    """
+    observed = np.asarray(pixels, dtype=float).ravel()
+    profile = np.asarray(gaussian, dtype=float).ravel()
+    design = np.column_stack((profile, np.ones_like(profile)))
+    weights = np.ones_like(observed)
+    use_prior = (
+        background_prior_sigma is not None
+        and np.isfinite(background_prior_sigma)
+        and background_prior_sigma > 0
+    )
+    amplitude, background = 0.0, float(background_prior)
+    for _ in range(maximum_irls_iterations):
+        sqrt_weights = np.sqrt(weights)
+        weighted_design = design * sqrt_weights[:, None] / noise_scale
+        weighted_observed = observed * sqrt_weights / noise_scale
+        if use_prior:
+            weighted_design = np.vstack(
+                (weighted_design, np.array([0.0, 1.0]) / background_prior_sigma)
+            )
+            weighted_observed = np.append(
+                weighted_observed, float(background_prior) / background_prior_sigma
+            )
+        coefficients, *_ = np.linalg.lstsq(
+            weighted_design, weighted_observed, rcond=None,
+        )
+        new_amplitude = max(float(coefficients[0]), 0.0)
+        if new_amplitude == 0.0:
+            data_weights = weights / noise_scale**2
+            numerator = float(np.sum(data_weights * observed))
+            denominator = float(np.sum(data_weights))
+            if use_prior:
+                prior_weight = 1.0 / background_prior_sigma**2
+                numerator += prior_weight * float(background_prior)
+                denominator += prior_weight
+            new_background = numerator / denominator
+        else:
+            new_background = float(coefficients[1])
+        residuals = (observed - (new_amplitude * profile + new_background)) / noise_scale
+        new_weights = _huber_weights(residuals, huber_delta)
+        converged = (
+            np.allclose([new_amplitude, new_background], [amplitude, background], rtol=1e-8, atol=1e-10)
+            and np.allclose(new_weights, weights, rtol=1e-7, atol=1e-9)
+        )
+        amplitude, background, weights = new_amplitude, new_background, new_weights
+        if converged:
+            break
+    residuals = (observed - (amplitude * profile + background)) / noise_scale
+    return amplitude, background, residuals, _huber_weights(residuals, huber_delta)
+
+
+def _fit_gaussian_robust_nelder_mead(
+    pixels, background_level, background_prior_sigma, noise_sigma,
+    use_background_prior, use_quadrant_preprocessing, method_identifier,
+    huber_delta=1.5,
+):
+    """Выполняет робастный Нелдер–Мид по x0/y0/log(sigma) в исходных LSB.
+
+    A и B профилируются IRLS в каждой точке; знаковые остатки не обрезаются.
+    background_prior используется мягко, а sigma ограничена только условием >0
+    через логарифмическую параметризацию, без априорных границ оптики.
+    """
+    raw_pixels = _as_valid_image(pixels, "pixels")
+    height, width = raw_pixels.shape
+    background_prior = float(background_level)
+    effective_prior_sigma = background_prior_sigma if use_background_prior else None
+
+    # Неотрицательная матрица используется только для устойчивой стартовой точки;
+    # сам fit ниже работает с исходными знаковыми остатками в LSB.
+    initialization_signal = np.clip(raw_pixels - background_prior, 0.0, None)
+    initialization_total = float(np.sum(initialization_signal))
+    x_grid = np.arange(width, dtype=float)
+    y_grid = np.arange(height, dtype=float)
+    if initialization_total > 0:
+        initialization_weights = initialization_signal / initialization_total
+    else:
+        initialization_weights = np.full_like(raw_pixels, 1.0 / raw_pixels.size)
+    quadrant = (
+        quadrant_preprocess(initialization_signal)
+        if use_quadrant_preprocessing else None
+    )
+    if quadrant is None:
+        x0_init = float(np.sum(initialization_weights * x_grid[None, :]))
+        y0_init = float(np.sum(initialization_weights * y_grid[:, None]))
+    else:
+        x0_init = quadrant["x0_init"]
+        y0_init = quadrant["y0_init"]
+    radial_variance = float(np.sum(
+        initialization_weights
+        * ((x_grid[None, :] - x0_init) ** 2 + (y_grid[:, None] - y0_init) ** 2)
+    ) / 2.0)
+    sigma_init = float(np.sqrt(max(radial_variance - 1.0 / 12.0, np.finfo(float).eps)))
+
+    # Если масштаб рамки отключён, он оценивается не по яркостям ROI (куда
+    # входит полезный сигнал), а по остаткам предварительной модели A*G+B.
+    if noise_sigma is not None and np.isfinite(noise_sigma) and noise_sigma > 0:
+        noise_scale = float(noise_sigma)
+    else:
+        initial_gaussian = model_image((height, width), x0_init, y0_init, sigma_init)
+        initial_design = np.column_stack(
+            (initial_gaussian.ravel(), np.ones(raw_pixels.size))
+        )
+        initial_coefficients, *_ = np.linalg.lstsq(
+            initial_design, raw_pixels.ravel(), rcond=None,
+        )
+        preliminary_amplitude = max(float(initial_coefficients[0]), 0.0)
+        preliminary_background = (
+            float(initial_coefficients[1]) if preliminary_amplitude > 0
+            else float(np.median(raw_pixels))
+        )
+        preliminary_residuals = (
+            raw_pixels - preliminary_amplitude * initial_gaussian - preliminary_background
+        )
+        noise_scale = _robust_scale(preliminary_residuals)
+
+    def evaluate(parameters, include_details=False):
+        """Вычисляет Huber-функционал и при запросе возвращает детали модели.
+
+        parameters=(x0,y0,log_sigma); экспонента обеспечивает только sigma>0.
+        include_details добавляет G, A, B, остатки и IRLS-веса для результата.
+        """
+        local_x0, local_y0, log_sigma = map(float, parameters)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            fitted_sigma = float(np.exp(log_sigma))
+        if not np.isfinite(fitted_sigma) or fitted_sigma <= 0:
+            return (1e300, None) if include_details else 1e300
+        gaussian = model_image((height, width), local_x0, local_y0, fitted_sigma)
+        amplitude, background, residuals, robust_weights = _profile_amplitude_background(
+            raw_pixels, gaussian, noise_scale, background_prior,
+            effective_prior_sigma, huber_delta,
+        )
+        cost = float(np.sum(_huber_values(residuals, huber_delta)))
+        if effective_prior_sigma is not None and effective_prior_sigma > 0:
+            cost += 0.5 * ((background - background_prior) / effective_prior_sigma) ** 2
+        if not include_details:
+            return cost
+        return cost, {
+            "x0": local_x0, "y0": local_y0, "sigma": fitted_sigma,
+            "gaussian": gaussian, "amplitude": amplitude, "background": background,
+            "residuals": residuals, "robust_weights": robust_weights,
+        }
+
+    initial_parameters = np.array([x0_init, y0_init, np.log(sigma_init)], dtype=float)
+    initial_loss, initial_details = evaluate(initial_parameters, include_details=True)
+    full_trace = [{
+        "iteration": 0, "x0": x0_init, "y0": y0_init,
+        "sigma": sigma_init, "loss": float(initial_loss),
+        "amplitude": initial_details["amplitude"],
+        "background": initial_details["background"],
+    }]
+
+    def record_iteration(current_parameters):
+        """Сохраняет реперную точку робастного Нелдера–Мида для анимации.
+
+        current_parameters содержат x0/y0/log_sigma; trace хранит физическую sigma
+        и значение полного Huber-функционала с фоновым prior.
+        """
+        current_x, current_y, current_log_sigma = map(float, current_parameters)
+        current_loss, current_details = evaluate(current_parameters, include_details=True)
+        full_trace.append({
+            "iteration": len(full_trace), "x0": current_x, "y0": current_y,
+            "sigma": float(np.exp(current_log_sigma)),
+            "loss": float(current_loss),
+            "amplitude": current_details["amplitude"],
+            "background": current_details["background"],
+        })
+
+    result = minimize(
+        evaluate,
+        initial_parameters,
+        method="Nelder-Mead",
+        callback=record_iteration,
+        options={"xatol": 1e-8, "fatol": 1e-10, "maxiter": 5000},
+    )
+    final_loss, details = evaluate(result.x, include_details=True)
+    final_state = {
+        "iteration": int(getattr(result, "nit", len(full_trace))),
+        "x0": details["x0"], "y0": details["y0"],
+        "sigma": details["sigma"], "loss": final_loss,
+        "amplitude": details["amplitude"], "background": details["background"],
+    }
+    if not full_trace or any(
+        abs(full_trace[-1][name] - final_state[name]) > 1e-12
+        for name in ("x0", "y0", "sigma")
+    ):
+        full_trace.append(final_state)
+    optimization_trace = _sample_optimization_trace(full_trace)
+
+    model_signal = details["amplitude"] * details["gaussian"]
+    fitted_full_model = details["background"] + model_signal
+    signed_signal = raw_pixels - details["background"]
+    standardized_residuals = details["residuals"].reshape(raw_pixels.shape)
+    robust_weights = details["robust_weights"].reshape(raw_pixels.shape)
+    outlier_mask = np.abs(standardized_residuals) > 3.5
+    outlier_coordinates = [
+        (int(column), int(row)) for row, column in np.argwhere(outlier_mask)
+    ]
+    valid_noise = np.isfinite(noise_scale) and noise_scale > 0
+    snr_peak = max(float(np.max(raw_pixels)) - details["background"], 0.0) / noise_scale
+    chi_square = float(np.sum(standardized_residuals**2))
+    degrees_of_freedom = max(raw_pixels.size - 5, 1)
+    return {
+        "method": method_identifier,
+        "x0": details["x0"], "y0": details["y0"], "sigma": details["sigma"],
+        "A": details["amplitude"], "success": bool(result.success),
+        "loss": final_loss, "model": details["gaussian"],
+        "model_signal": model_signal, "full_model": fitted_full_model,
+        "fit_signal": signed_signal,
+        "abs_errors": np.abs(raw_pixels - fitted_full_model),
+        "weights": robust_weights, "robust_weights": robust_weights,
+        "standardized_residuals": standardized_residuals,
+        "outlier_mask": outlier_mask, "outlier_count": int(np.sum(outlier_mask)),
+        "outlier_coordinates": outlier_coordinates,
+        "background_level": details["background"],
+        "fitted_background": details["background"],
+        "background_prior": background_prior,
+        "background_prior_sigma": effective_prior_sigma,
+        "background_subtracted": False,
+        "background_profiled": True,
+        "background_prior_used": bool(effective_prior_sigma is not None),
+        "noise_sigma": noise_scale if valid_noise else None,
+        "robust_scale": noise_scale, "huber_delta": huber_delta,
+        "snr_peak": float(snr_peak), "chi_square": chi_square,
+        "reduced_chi_square": chi_square / degrees_of_freedom,
+        "quadrant": quadrant, "optimization_trace": optimization_trace,
+        "robust": True, "message": result.message,
+    }
+
+
+def fit_gaussian_robust_nelder_mead(
+    pixels, background_level=0.0, background_prior_sigma=None,
+    use_background_prior=True, noise_sigma=None,
+):
+    """Запускает робастный профилированный Нелдер–Мид из центроида.
+
+    background_level/prior_sigma задают мягкую информацию рамки; noise_sigma
+    масштабирует Huber-остатки. Никакой априорной границы sigma не вводится.
+    """
+    return _fit_gaussian_robust_nelder_mead(
+        pixels, background_level, background_prior_sigma, noise_sigma,
+        use_background_prior, False, FIT_METHOD_ROBUST_NELDER_MEAD,
+    )
+
+
+def fit_gaussian_quadrant_robust_nelder_mead(
+    pixels, background_level=0.0, background_prior_sigma=None,
+    use_background_prior=True, noise_sigma=None,
+):
+    """Добавляет квадрантную стартовую точку к робастному Нелдеру–Миду.
+
+    Квадранты не ограничивают дальнейший поиск; A/B профилируются, а sigma
+    остаётся свободной положительной величиной без сведений об оптике.
+    """
+    return _fit_gaussian_robust_nelder_mead(
+        pixels, background_level, background_prior_sigma, noise_sigma,
+        use_background_prior, True, FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD,
+    )
+
+
 def fit_gaussian_nelder_mead(
     pixels, background_level=0.0, subtract_background=True, noise_sigma=None,
 ):
@@ -609,13 +935,13 @@ def fit_gaussian_quadrant_nelder_mead(
 
 def fit_gaussian(
     pixels, method=FIT_METHOD_NELDER_MEAD, background_level=0.0,
-    subtract_background=True, noise_sigma=None,
+    subtract_background=True, noise_sigma=None, background_prior_sigma=None,
 ):
     """Направляет ROI в выбранный алгоритм оценки ФРТ.
 
     method — строковый идентификатор выпадающего списка; остальные переменные
-    передаются методу. Зарегистрированы обычный и квадрантно-инициализированный
-    Нелдер–Мид; новые алгоритмы добавляются без изменения интерфейсной цепочки.
+    передаются методу. Для robust-вариантов subtract_background включает мягкий
+    prior рамки вместо жёсткого вычитания; background_prior_sigma задаёт его СКО.
     """
     if method == FIT_METHOD_NELDER_MEAD:
         return fit_gaussian_nelder_mead(
@@ -624,6 +950,16 @@ def fit_gaussian(
     if method == FIT_METHOD_QUADRANT_NELDER_MEAD:
         return fit_gaussian_quadrant_nelder_mead(
             pixels, background_level, subtract_background, noise_sigma
+        )
+    if method == FIT_METHOD_ROBUST_NELDER_MEAD:
+        return fit_gaussian_robust_nelder_mead(
+            pixels, background_level, background_prior_sigma,
+            subtract_background, noise_sigma,
+        )
+    if method == FIT_METHOD_QUADRANT_ROBUST_NELDER_MEAD:
+        return fit_gaussian_quadrant_robust_nelder_mead(
+            pixels, background_level, background_prior_sigma,
+            subtract_background, noise_sigma,
         )
     raise ValueError(f"Неизвестный метод оценки: {method}")
 

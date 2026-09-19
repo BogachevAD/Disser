@@ -174,11 +174,11 @@ class AlgorithmAnimationDialog(QDialog):
     def _draw_nelder_model(self, axis, state, trace_index):
         """Рисует справа модель ФРТ для текущего состояния Нелдера–Мида.
 
-        axis — правая панель; state задаёт x0/y0/sigma/loss/iteration, а
-        trace_index используется в заголовке прогресса по сохранённым состояниям.
+        axis — правая панель; state задаёт x0/y0/sigma/loss/iteration.
+        Для robust trace он также содержит профилированные A и B.
         """
         model = model_image(self.signal.shape, state["x0"], state["y0"], state["sigma"])
-        model *= np.sum(self.signal)
+        model *= state.get("amplitude", np.sum(self.signal))
         axis.imshow(model, cmap="gray", interpolation="nearest")
         axis.plot(state["x0"], state["y0"], "rx", markersize=10, mew=2)
         axis.add_patch(
@@ -189,7 +189,10 @@ class AlgorithmAnimationDialog(QDialog):
         )
         axis.set_xticks(range(self.signal.shape[1]))
         axis.set_yticks(range(self.signal.shape[0]))
-        axis.set_title(f"Нелдер–Мид: состояние {trace_index + 1}/{len(self.frames)}")
+        title = f"Нелдер–Мид: состояние {trace_index + 1}/{len(self.frames)}"
+        if "background" in state:
+            title += f"\nA={state['amplitude']:.3g}, B={state['background']:.3g} LSB"
+        axis.set_title(title)
 
     def _draw_frame(self):
         """Перерисовывает обе панели для текущего frame_index.
