@@ -1,9 +1,9 @@
 """Собирает автономное Windows-приложение через PyInstaller.
 
-Сценарий создаёт изолированное окружение `.build_venv`, устанавливает обычные
-и сборочные зависимости, затем упаковывает `run_gauss_simulator.py` в один EXE.
-Результат помещается в `dist/IK_Gaussian_Simulator.exe`; Python на целевом
-компьютере не требуется.
+Сценарий можно запускать напрямую кнопкой Run в PyCharm. Он создаёт изолированное
+окружение `.build_venv`, устанавливает зависимости, упаковывает точку входа и
+README со встроенной справкой в один EXE. Результат помещается в
+`dist/IK_Gaussian_Simulator.exe`; Python на целевом компьютере не требуется.
 """
 
 import argparse
@@ -19,6 +19,7 @@ import venv
 APPLICATION_NAME = "IK_Gaussian_Simulator"
 ENTRY_POINT = "run_gauss_simulator.py"
 BUILD_ENVIRONMENT = ".build_venv"
+BUNDLED_DATA_FILES = ("README.md",)
 
 
 def run_command(command, working_directory, environment=None):
@@ -29,6 +30,26 @@ def run_command(command, working_directory, environment=None):
     """
     print("\n>", subprocess.list2cmdline([str(item) for item in command]))
     subprocess.run(command, cwd=working_directory, check=True, env=environment)
+
+
+def ensure_application_is_closed(output_path):
+    """Проверяет, доступен ли прежний EXE для замены PyInstaller.
+
+    output_path — ожидаемый файл сборки. На Windows попытка открыть запущенный
+    EXE для записи завершается PermissionError; данные при этой проверке не
+    изменяются. Это надёжнее tasklist, доступ к которому может быть запрещён.
+    """
+    if os.name != "nt" or not output_path.is_file():
+        return
+    process_name = f"{APPLICATION_NAME}.exe"
+    try:
+        with output_path.open("r+b"):
+            pass
+    except PermissionError:
+        raise RuntimeError(
+            f"Закройте {process_name} перед пересборкой: Windows не позволяет "
+            "перезаписать запущенный EXE. Затем снова нажмите Run в PyCharm."
+        ) from None
 
 
 def isolated_build_environment(environment_python):
@@ -120,6 +141,12 @@ def pyinstaller_command(environment_python, project_root, one_file=True):
         "--hidden-import",
         "matplotlib.backends.backend_qtagg",
     ]
+
+    # README является ресурсом приложения: MethodHelpDialog читает из него
+    # отмеченный раздел как в PyCharm, так и после распаковки one-file EXE.
+    for relative_path in BUNDLED_DATA_FILES:
+        source_path = project_root / relative_path
+        command.extend(["--add-data", f"{source_path}{os.pathsep}."])
     command.append("--onefile" if one_file else "--onedir")
 
     # Иконка применяется автоматически, если пользователь добавит assets/app.ico.
@@ -159,6 +186,15 @@ def build_executable(project_root, recreate_environment=False, skip_install=Fals
     project_root — каталог исходников; два флага управляют окружением и pip;
     one_file выбирает формат. Возвращается проверенный путь готового EXE.
     """
+    ensure_application_is_closed(executable_path(project_root, one_file))
+    missing_resources = [
+        project_root / relative_path
+        for relative_path in BUNDLED_DATA_FILES
+        if not (project_root / relative_path).is_file()
+    ]
+    if missing_resources:
+        missing_text = ", ".join(str(path) for path in missing_resources)
+        raise FileNotFoundError(f"Не найдены ресурсы для встроенной справки: {missing_text}")
     (project_root / "build").mkdir(exist_ok=True)
     environment_python = build_environment_python(project_root, recreate_environment)
     if not skip_install:
@@ -182,7 +218,10 @@ def build_argument_parser():
     """
     parser = argparse.ArgumentParser(description="Сборка IK Gaussian Simulator в Windows EXE")
     parser.add_argument("--recreate-env", action="store_true", help="Пересоздать .build_venv")
-    parser.add_argument("--skip-install", action="store_true", help="Не запускать pip install")
+    parser.add_argument(
+        "--skip-install", "--quick", dest="skip_install", action="store_true",
+        help="Быстрая повторная сборка: не запускать pip install",
+    )
     parser.add_argument("--onedir", action="store_true", help="Собрать папку вместо одного EXE")
     return parser
 
@@ -200,17 +239,21 @@ def main(argv=None):
 
     arguments = build_argument_parser().parse_args(argv)
     project_root = Path(__file__).resolve().parent
-    result = build_executable(
-        project_root,
-        recreate_environment=arguments.recreate_env,
-        skip_install=arguments.skip_install,
-        one_file=not arguments.onedir,
-    )
+    try:
+        result = build_executable(
+            project_root,
+            recreate_environment=arguments.recreate_env,
+            skip_install=arguments.skip_install,
+            one_file=not arguments.onedir,
+        )
+    except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"\nСборка остановлена: {error}") from None
     size_megabytes = result.stat().st_size / (1024 * 1024)
     print("\nСборка успешно завершена.")
     print(f"Файл: {result}")
     print(f"Размер: {size_megabytes:.1f} MiB")
     print(f"SHA-256: {sha256_file(result)}")
+    print("Повторная сборка из PyCharm: запустите build_exe.py с параметром --quick.")
 
 
 if __name__ == "__main__":

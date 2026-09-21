@@ -23,9 +23,11 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QStyle,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +53,7 @@ from gaussian_math import (
     select_roi,
 )
 from algorithm_animation import AlgorithmAnimationDialog
+from method_help import MethodHelpDialog
 
 
 @dataclass(frozen=True)
@@ -304,6 +307,7 @@ class GaussianSimulatorWindow(QMainWindow):
         self._last_frame_generation_signature = None
         self.calculation_index = 0
         self.inputs = {}
+        self.method_help_dialog = None
         self.setWindowTitle("Модель гауссова кадра и субпиксельной оценки")
         self.resize(1580, 980)
         self._build_ui()
@@ -318,6 +322,21 @@ class GaussianSimulatorWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(8)
+
+        # Компактная кнопка в правом верхнем углу открывает автономную справку,
+        # загружаемую из README как в исходниках, так и в собранном EXE.
+        header_row = QHBoxLayout()
+        header_row.addStretch(1)
+        self.help_button = QToolButton()
+        self.help_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion)
+        )
+        self.help_button.setAccessibleName("Справка по методам оценивания")
+        self.help_button.setToolTip("Классический и робастный Нелдер–Мид: формулы и сравнение")
+        self.help_button.setFixedSize(32, 32)
+        self.help_button.clicked.connect(self._on_help_clicked)
+        header_row.addWidget(self.help_button)
+        root_layout.addLayout(header_row)
 
         # Верхняя строка объединяет параметры кадра, ФРТ, шумов и алгоритма ROI.
         controls_row = QHBoxLayout()
@@ -984,6 +1003,18 @@ class GaussianSimulatorWindow(QMainWindow):
             return
         dialog = AlgorithmAnimationDialog(self.last_fit, self)
         dialog.exec()
+
+    def _on_help_clicked(self):
+        """Открывает или активирует окно подробной справки по двум методам.
+
+        Входных переменных нет; MethodHelpDialog самостоятельно читает отмеченный
+        раздел README. Один экземпляр переиспользуется без пересчёта модели.
+        """
+        if self.method_help_dialog is None:
+            self.method_help_dialog = MethodHelpDialog(self)
+        self.method_help_dialog.show()
+        self.method_help_dialog.raise_()
+        self.method_help_dialog.activateWindow()
 
 
 GaussianSimulatorApp = GaussianSimulatorWindow

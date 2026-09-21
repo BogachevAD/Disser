@@ -6,8 +6,15 @@
 
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
-from build_exe import APPLICATION_NAME, executable_path, isolated_build_environment, pyinstaller_command
+from build_exe import (
+    APPLICATION_NAME,
+    ensure_application_is_closed,
+    executable_path,
+    isolated_build_environment,
+    pyinstaller_command,
+)
 
 
 class BuildExeTests(unittest.TestCase):
@@ -28,6 +35,8 @@ class BuildExeTests(unittest.TestCase):
         self.assertIn("--windowed", command)
         self.assertNotIn("--collect-all", command)
         self.assertIn("matplotlib.backends.backend_qtagg", command)
+        add_data_index = command.index("--add-data")
+        self.assertIn("README.md", str(command[add_data_index + 1]))
         self.assertEqual(command[-1], root / "run_gauss_simulator.py")
 
     def test_output_path_depends_on_bundle_mode(self):
@@ -52,6 +61,24 @@ class BuildExeTests(unittest.TestCase):
         environment = isolated_build_environment(python)
         self.assertIn(str(python.parent), environment["PATH"])
         self.assertNotIn("poppler", environment["PATH"].lower())
+
+    @patch("build_exe.os.name", "nt")
+    def test_running_executable_is_reported_before_long_build(self):
+        """Проверяет понятную ошибку, если предыдущий EXE открыт пользователем."""
+        output_path = Path("C:/project/dist/IK_Gaussian_Simulator.exe")
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(Path, "open", side_effect=PermissionError),
+            self.assertRaisesRegex(RuntimeError, "Закройте IK_Gaussian_Simulator.exe"),
+        ):
+            ensure_application_is_closed(output_path)
+
+    @patch("build_exe.os.name", "nt")
+    def test_absent_executable_allows_build(self):
+        """Не блокирует сборку, когда предыдущего файла приложения ещё нет."""
+        output_path = Path("C:/project/dist/IK_Gaussian_Simulator.exe")
+        with patch.object(Path, "is_file", return_value=False):
+            ensure_application_is_closed(output_path)
 
 
 if __name__ == "__main__":

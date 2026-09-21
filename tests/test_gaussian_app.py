@@ -12,7 +12,7 @@ import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QGroupBox, QTableWidget
+from PyQt6.QtWidgets import QApplication, QGroupBox, QTableWidget, QToolButton
 
 from algorithm_animation import AlgorithmAnimationDialog
 from gaussian_app import GaussianSimulatorWindow
@@ -186,6 +186,33 @@ class GaussianAppNoiseTests(unittest.TestCase):
         finally:
             if dialog is not None:
                 dialog.close()
+            window.close()
+
+    def test_help_button_opens_embedded_method_documentation(self):
+        """Проверяет значок справки и загрузку полного текста из README.
+
+        Клик не должен пересчитывать модель; диалог содержит разделы про
+        классический функционал, Huber и прямую сравнительную таблицу.
+        """
+        window = self.make_window()
+        try:
+            calculation_index = window.calculation_index
+            self.assertIsInstance(window.help_button, QToolButton)
+            self.assertEqual(
+                window.help_button.accessibleName(), "Справка по методам оценивания",
+            )
+            window.help_button.click()
+            self.app.processEvents()
+            dialog = window.method_help_dialog
+            self.assertIsNotNone(dialog)
+            self.assertTrue(dialog.isVisible())
+            help_text = dialog.browser.toPlainText()
+            self.assertIn("Классический функционал", help_text)
+            self.assertIn("Функция потерь Хьюбера", help_text)
+            self.assertIn("Прямое сравнение реализаций", help_text)
+            self.assertEqual(window.calculation_index, calculation_index)
+            dialog.close()
+        finally:
             window.close()
 
 
