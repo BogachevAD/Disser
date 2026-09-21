@@ -25,6 +25,7 @@ class MethodHelpTests(unittest.TestCase):
         self.assertIn("### 24. Прямое сравнение реализаций", markdown)
         self.assertNotIn("METHOD_HELP_START", markdown)
         self.assertNotIn("<details>", markdown)
+        self.assertNotIn(r"\operatorname", readme_path.read_text(encoding="utf-8"))
 
     def test_latex_has_readable_fallback_without_document(self):
         """Сохраняет текст формулы, если QTextDocument не был передан."""

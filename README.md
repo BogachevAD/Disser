@@ -185,8 +185,8 @@ $$
 масштабируется к `AMPLITUDE_LSB`, добавляется постоянный фон и два шума:
 
 $$
-I_{ij}=\operatorname{clip}\left[
-B+A\frac{G_{ij}}{\max(G)}+sigma_g N^{(g)}_{ij}+sigma_t N^{(t)}_{ij},
+I_{ij}=\mathrm{clip}\left[
+B+A\frac{G_{ij}}{\max(G)}+\sigma_g N^{(g)}_{ij}+\sigma_t N^{(t)}_{ij},
 0,2^{N_{ADC}}-1
 \right].
 $$
@@ -301,8 +301,8 @@ s_B=\sqrt{\frac{1}{N-1}\sum_{k=1}^{N}(B_k-\bar B)^2}.
 $$
 
 $$
-B_{med}=\operatorname{median}(B_k),\qquad
-MAD=\operatorname{median}|B_k-B_{med}|,
+B_{med}=\mathrm{median}(B_k),\qquad
+MAD=\mathrm{median}|B_k-B_{med}|,
 $$
 
 $$
@@ -664,7 +664,7 @@ $$
 Из него вычитается дисперсия интегрирования по площади пикселя:
 
 $$
-\operatorname{Var}_{pixel}=\frac{1}{12}.
+\mathrm{Var}_{pixel}=\frac{1}{12}.
 $$
 
 Итоговая стартовая оценка:
@@ -802,13 +802,13 @@ $$
 Вместо среднего уровня рамки используется медиана:
 
 $$
-B_{med}=\operatorname{median}(B_k).
+B_{med}=\mathrm{median}(B_k).
 $$
 
 Робастный масштаб шума строится по абсолютным отклонениям:
 
 $$
-MAD=\operatorname{median}|B_k-B_{med}|,
+MAD=\mathrm{median}|B_k-B_{med}|,
 $$
 
 $$
