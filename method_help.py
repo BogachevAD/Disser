@@ -5,11 +5,15 @@
 EXE и извлекается во временный каталог вместе с остальными ресурсами.
 """
 
+from io import BytesIO
 from pathlib import Path
 import re
 import sys
 
-from PyQt6.QtGui import QTextCursor
+from matplotlib.font_manager import FontProperties
+from matplotlib.mathtext import math_to_image
+from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -59,24 +63,151 @@ def load_method_help_markdown(readme_path=None):
     return section.strip()
 
 
-def markdown_for_qt(markdown):
-    """Адаптирует GitHub Markdown к возможностям QTextDocument.
+def _replace_math_environment(formula, environment, left, right):
+    """Заменяет cases/bmatrix на поддерживаемую MathText конструкцию.
 
-    Qt отображает заголовки, списки и таблицы, но не вычисляет LaTeX. Блочные
-    формулы превращаются в отдельные моноширинные панели, а короткие формулы —
-    во встроенный код: обозначения сохраняются полностью и остаются читаемыми.
+    formula содержит нормализованный LaTeX; environment задаёт имя окружения,
+    left/right — визуальные скобки. Строки собираются через `substack`, а
+    разделитель столбцов `&` заменяется математическим интервалом.
     """
+    pattern = rf"\\begin\{{{environment}\}}(.*?)\\end\{{{environment}\}}"
+
+    def replacement(match):
+        rows = re.split(r"\\\\(?:\[[^]]+\])?", match.group(1))
+        rows = [row.strip().replace("&", r"\quad") for row in rows if row.strip()]
+        return left + r"\substack{" + r" \\ ".join(rows) + "}" + right
+
+    return re.sub(pattern, replacement, formula)
+
+
+def normalize_mathtext_formula(formula):
+    """Приводит используемый в README LaTeX к диалекту Matplotlib MathText.
+
+    formula — содержимое `$...$` или `$$...$$`. Переносы схлопываются, краткие
+    команды получают явные фигурные скобки, а cases/bmatrix преобразуются без
+    изменения математического смысла. Результат пригоден для офлайн-отрисовки.
+    """
+    normalized = " ".join(formula.strip().split())
+    normalized = normalized.replace(r"\dfrac", r"\frac")
+    normalized = normalized.replace(r"\frac12", r"\frac{1}{2}")
+    normalized = re.sub(r"\\overline\s+([A-Za-z])", r"\\overline{\1}", normalized)
+    normalized = re.sub(
+        r"\\boldsymbol\s*(\\[A-Za-z]+)", r"\\mathbf{\1}", normalized
+    )
+    normalized = re.sub(r"\\mathbf\s+([A-Za-z])", r"\\mathbf{\1}", normalized)
+    normalized = _replace_math_environment(
+        normalized, "bmatrix", r"\left[", r"\right]"
+    )
+    normalized = _replace_math_environment(
+        normalized, "cases", r"\left\{", r"\right."
+    )
+
+    # MathText не реализует \boxed. Рамка добавляется к изображению стилем Qt,
+    # поэтому здесь снимается только самая внешняя команда, если она есть.
+    if normalized.startswith(r"\boxed{"):
+        prefix = r"\boxed{"
+        depth = 1
+        closing_index = None
+        for index in range(len(prefix), len(normalized)):
+            character = normalized[index]
+            escaped = index > 0 and normalized[index - 1] == "\\"
+            if character == "{" and not escaped:
+                depth += 1
+            elif character == "}" and not escaped:
+                depth -= 1
+                if depth == 0:
+                    closing_index = index
+                    break
+        if closing_index is not None:
+            normalized = normalized[len(prefix):closing_index] + normalized[closing_index + 1:]
+    return normalized
+
+
+def render_formula_image(formula, device_pixel_ratio=2.0):
+    """Рендерит одну LaTeX-формулу в прозрачный QImage высокого разрешения.
+
+    formula передаётся без внешних долларов; device_pixel_ratio задаёт
+    масштаб Retina/HiDPI. Matplotlib MathText работает без LaTeX и интернета,
+    поэтому изображение доступно и в автономном EXE.
+    """
+    boxed = formula.strip().startswith(r"\boxed{")
+    normalized = normalize_mathtext_formula(formula)
+    output = BytesIO()
+    math_to_image(
+        f"${normalized}$",
+        output,
+        format="png",
+        dpi=200,
+        prop=FontProperties(size=14),
+        color="#111111",
+    )
+    image = QImage.fromData(output.getvalue(), "PNG")
+    if image.isNull():
+        raise ValueError("Matplotlib вернул пустое изображение формулы")
+    if boxed:
+        padding = 10
+        framed = QImage(
+            image.width() + 2 * padding,
+            image.height() + 2 * padding,
+            QImage.Format.Format_ARGB32,
+        )
+        framed.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(framed)
+        painter.drawImage(padding, padding, image)
+        painter.setPen(QPen(QColor("#333333"), 2))
+        painter.drawRect(1, 1, framed.width() - 3, framed.height() - 3)
+        painter.end()
+        image = framed
+    image.setDevicePixelRatio(device_pixel_ratio)
+    return image
+
+
+def markdown_for_qt(markdown, document=None):
+    """Заменяет LaTeX в Markdown ссылками на отрисованные формулы.
+
+    markdown — исходная справка, document — QTextDocument для регистрации
+    QImage-ресурсов и установки готовой разметки. Без document функция оставляет
+    понятный текстовый fallback. Неотрисованная формула также остаётся кодом.
+    """
+    formula_index = 0
+    image_resources = []
+
+    def image_reference(formula, block):
+        nonlocal formula_index
+        source = formula.strip()
+        if document is None:
+            return ("\n```text\n" + source + "\n```\n") if block else f"`{source}`"
+        resource_url = QUrl(f"formula://method-help/{formula_index}")
+        formula_index += 1
+        try:
+            image = render_formula_image(source)
+        except (ValueError, RuntimeError):
+            return ("\n```text\n" + source + "\n```\n") if block else f"`{source}`"
+        image_resources.append((resource_url, image))
+        alt = "Математическая формула"
+        reference = f"![{alt}]({resource_url.toString()})"
+        return f"\n\n{reference}\n\n" if block else reference
+
     prepared = re.sub(
         r"\$\$\s*(.*?)\s*\$\$",
-        lambda match: "\n```text\n" + match.group(1).strip() + "\n```\n",
+        lambda match: image_reference(match.group(1), True),
         markdown,
         flags=re.DOTALL,
     )
     prepared = re.sub(
         r"(?<!\$)\$([^$\n]+)\$(?!\$)",
-        lambda match: "`" + match.group(1).strip() + "`",
+        lambda match: image_reference(match.group(1), False),
         prepared,
     )
+    if document is not None:
+        # setMarkdown очищает ранее добавленные ресурсы, поэтому изображения
+        # регистрируются после разбора текста и затем документ перерисовывается.
+        document.setMarkdown(prepared)
+        for resource_url, image in image_resources:
+            document.addResource(
+                QTextDocument.ResourceType.ImageResource, resource_url, image
+            )
+        document.markContentsDirty(0, document.characterCount())
     return prepared
 
 
@@ -102,8 +233,8 @@ class MethodHelpDialog(QDialog):
         layout.addWidget(heading)
 
         note = QLabel(
-            "Справка загружается из README. Формулы показаны в моноширинных "
-            "математических блоках без потери обозначений."
+            "Справка загружается из README. Формулы автоматически отрисованы "
+            "в математической нотации и доступны без интернета."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
@@ -132,7 +263,7 @@ class MethodHelpDialog(QDialog):
             "td, th { padding: 4px; }"
         )
         source = load_method_help_markdown() if markdown is None else markdown
-        self.browser.setMarkdown(markdown_for_qt(source))
+        markdown_for_qt(source, self.browser.document())
         layout.addWidget(self.browser, stretch=1)
 
         bottom_row = QHBoxLayout()
@@ -148,6 +279,7 @@ class MethodHelpDialog(QDialog):
         self.search_input.returnPressed.connect(self._find_next)
         self.to_start_button.clicked.connect(self._go_to_start)
         close_button.clicked.connect(self.close)
+        self._go_to_start()
 
     def _find_next(self):
         """Ищет следующее вхождение строки из search_input в справочном тексте.
