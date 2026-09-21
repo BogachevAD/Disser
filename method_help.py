@@ -167,7 +167,8 @@ def markdown_for_qt(markdown, document=None):
 
     markdown — исходная справка, document — QTextDocument для регистрации
     QImage-ресурсов и установки готовой разметки. Без document функция оставляет
-    понятный текстовый fallback. Неотрисованная формула также остаётся кодом.
+    понятный текстовый fallback. Поддерживаются GitHub-блоки ```math, старые
+    блоки $$...$$ и встроенные $...$; неотрисованная формула остаётся кодом.
     """
     formula_index = 0
     image_resources = []
@@ -188,10 +189,18 @@ def markdown_for_qt(markdown, document=None):
         reference = f"![{alt}]({resource_url.toString()})"
         return f"\n\n{reference}\n\n" if block else reference
 
+    # Fenced math — официальный и наиболее устойчивый формат GitHub внутри
+    # сворачиваемого HTML-блока <details>. Обрабатываем его раньше обычных fences.
+    prepared = re.sub(
+        r"```math\s*\n(.*?)\n```",
+        lambda match: image_reference(match.group(1), True),
+        markdown,
+        flags=re.DOTALL,
+    )
     prepared = re.sub(
         r"\$\$\s*(.*?)\s*\$\$",
         lambda match: image_reference(match.group(1), True),
-        markdown,
+        prepared,
         flags=re.DOTALL,
     )
     prepared = re.sub(
