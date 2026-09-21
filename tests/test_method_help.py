@@ -27,7 +27,11 @@ class MethodHelpTests(unittest.TestCase):
         self.assertNotIn("<details>", markdown)
         self.assertIn("```math", markdown)
         self.assertNotIn("$$", markdown)
-        self.assertNotIn(r"\operatorname", readme_path.read_text(encoding="utf-8"))
+        readme = readme_path.read_text(encoding="utf-8")
+        self.assertIn("## Подробное описание и математическая справка", readme)
+        self.assertNotIn("<details>", readme)
+        self.assertNotIn("<summary>", readme)
+        self.assertNotIn(r"\operatorname", readme)
 
     def test_latex_has_readable_fallback_without_document(self):
         """Сохраняет текст формулы, если QTextDocument не был передан."""
